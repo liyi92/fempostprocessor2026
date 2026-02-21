@@ -1,2 +1,4 @@
 pyvista
 meshio
+seacas
+streamlit
