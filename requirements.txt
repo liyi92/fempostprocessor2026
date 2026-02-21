@@ -2,3 +2,4 @@ pyvista
 meshio
 #seacas
 streamlit
+netCDF4
