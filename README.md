@@ -2,5 +2,5 @@
 
 App
 
-[![battery](https://img.shields.io/badge/exodusvis1-streamlit-red)](https://fem-outputvisualization1.streamlit.app/)  (Comparison of Models for Applications and Limitations)
+[![battery](https://img.shields.io/badge/exodusvis1-streamlit-red)](https://moosemila.streamlit.app)  (Comparison of Models for Applications and Limitations)
 
