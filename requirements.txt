@@ -3,3 +3,4 @@ meshio
 #seacas
 streamlit
 netCDF4
+plotly
