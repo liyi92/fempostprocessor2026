@@ -1,4 +1,4 @@
 pyvista
 meshio
-seacas
+#seacas
 streamlit
