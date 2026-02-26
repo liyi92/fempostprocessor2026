@@ -75,6 +75,8 @@
 []
 
 [AuxVariables]
+  [./bnds]
+  [../]
   [./delta_eta1]
   [../]
   [./delta_eta2]
