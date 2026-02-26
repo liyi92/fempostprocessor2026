@@ -754,7 +754,16 @@
 []
 
 [AuxKernels]
-  [./deta1]
+[./bnds]
+    type = BndsCalcAux
+    variable = bnds
+    var_name_base = eta
+    op_num = 4 #2
+    v = 'eta1 eta2 eta3 eta4' #Not writing a variable here will put a 0 value on the eta value of the absentee
+  [../]
+
+
+[./deta1]
     type = DeltaUAux
     variable = delta_eta1
     coupled_variable = eta1  
