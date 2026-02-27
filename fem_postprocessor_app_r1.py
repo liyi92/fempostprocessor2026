@@ -3,195 +3,549 @@ import meshio
 import numpy as np
 import tempfile
 import os
-import re
+import sys
 from pathlib import Path
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import json
+import base64
+from io import BytesIO, StringIO
 import warnings
+import re
+import math
+from datetime import datetime
+import pandas as pd
 warnings.filterwarnings('ignore')
 
 # -----------------------------------------------------------------------------
 # Page Configuration
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="MOOSE Exodus Viewer", layout="wide", page_icon="🦌")
+st.set_page_config(
+    page_title="MOOSE Exodus Viewer",
+    page_icon="🦌",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://mooseframework.inl.gov',
+        'Report a bug': 'https://github.com/idaholab/moose/issues',
+        'About': "MOOSE Exodus Viewer v3.0\nBuilt with Streamlit + Plotly + Meshio"
+    }
+)
 
 # -----------------------------------------------------------------------------
-# Helper Functions - File Discovery (split-file aware)
+# Custom CSS for Better UI
+# -----------------------------------------------------------------------------
+st.markdown("""
+<style>
+.main-header {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: #1f77b4;
+    text-align: center;
+    padding: 1rem 0;
+    border-bottom: 3px solid #1f77b4;
+    margin-bottom: 1.5rem;
+}
+.metric-card {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    border-radius: 10px;
+    padding: 1rem;
+    color: white;
+    text-align: center;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+.metric-value {
+    font-size: 2rem;
+    font-weight: bold;
+}
+.metric-label {
+    font-size: 0.9rem;
+    opacity: 0.9;
+}
+.download-btn {
+    width: 100%;
+    margin: 0.25rem 0;
+}
+.success-box {
+    background-color: #d4edda;
+    border: 1px solid #c3e6cb;
+    border-radius: 5px;
+    padding: 1rem;
+    margin: 0.5rem 0;
+}
+.warning-box {
+    background-color: #fff3cd;
+    border: 1px solid #ffeaa7;
+    border-radius: 5px;
+    padding: 1rem;
+    margin: 0.5rem 0;
+}
+.error-box {
+    background-color: #f8d7da;
+    border: 1px solid #f5c6cb;
+    border-radius: 5px;
+    padding: 1rem;
+    margin: 0.5rem 0;
+}
+div[data-testid="stExpander"] {
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+}
+pre {
+    max-height: 400px;
+    overflow-y: auto;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# -----------------------------------------------------------------------------
+# Export Formats
+# -----------------------------------------------------------------------------
+SUPPORTED_EXPORT_FORMATS = {
+    'vtu': {
+        'name': 'VTU (Unstructured Grid)',
+        'ext': '.vtu',
+        'mime': 'application/xml',
+        'desc': 'Full 3D mesh with all variables (RECOMMENDED for ParaView)',
+        'surface_only': False
+    },
+    'vtk': {
+        'name': 'VTK (Legacy)',
+        'ext': '.vtk',
+        'mime': 'text/plain',
+        'desc': 'Legacy VTK format (widely compatible)',
+        'surface_only': False
+    },
+    'stl': {
+        'name': 'STL (Surface)',
+        'ext': '.stl',
+        'mime': 'application/sla',
+        'desc': 'Surface mesh for CAD/3D printing (no scalar data)',
+        'surface_only': True
+    },
+    'ply': {
+        'name': 'PLY (Polygon)',
+        'ext': '.ply',
+        'mime': 'application/octet-stream',
+        'desc': 'Surface with vertex colors/data (good for visualization)',
+        'surface_only': True
+    },
+    'xdmf': {
+        'name': 'XDMF (Large Data)',
+        'ext': '.xdmf',
+        'mime': 'application/xml',
+        'desc': 'XDMF for large datasets (requires h5py)',
+        'surface_only': False,
+        'requires': ['h5py']
+    },
+    'exodus': {
+        'name': 'Exodus (MOOSE Native)',
+        'ext': '.e',
+        'mime': 'application/octet-stream',
+        'desc': 'Native MOOSE format (for re-import)',
+        'surface_only': False
+    },
+}
+
+# -----------------------------------------------------------------------------
+# Helper Functions - Part File Discovery & Combination
 # -----------------------------------------------------------------------------
 def is_part_file(filename):
-    """Return True if filename ends with .part followed by digits."""
-    return bool(re.search(r'\.part\d+$', filename))
+    """Check if filename matches .e.partN pattern."""
+    return bool(re.search(r'\.e\.part\d+$', filename, re.IGNORECASE))
 
-def get_base_name_from_part(part_filename):
-    """Remove the .partN suffix to get the base filename."""
-    return re.sub(r'\.part\d+$', '', part_filename)
+def extract_part_number(filename):
+    """Extract numeric part index from filename like 'file.e.part3' -> 3."""
+    match = re.search(r'\.part(\d+)$', filename, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+def find_part_files_for_base(base_path, max_parts=1000):
+    """
+    Find all .e.partN files for a given base Exodus file.
+    Returns sorted list of part file paths, or empty list if none found.
+    """
+    base = Path(base_path)
+    part_files = []
+    
+    for i in range(1, max_parts + 1):
+        part_file = base.parent / f"{base.name}.part{i}"
+        if part_file.exists():
+            part_files.append(str(part_file))
+        else:
+            # Stop at first missing part (assumes sequential numbering)
+            if i > 1:
+                break
+    
+    # Sort by part number to ensure correct order
+    part_files.sort(key=lambda x: extract_part_number(os.path.basename(x)))
+    return part_files
+
+def combine_part_files_binary(part_files, output_path):
+    """
+    Concatenate part files in binary mode to recreate original file.
+    Returns True on success, False on failure.
+    """
+    if not part_files:
+        return False
+    
+    try:
+        with open(output_path, 'wb') as outfile:
+            for part_file in part_files:
+                with open(part_file, 'rb') as infile:
+                    # Read in chunks to handle large files
+                    while True:
+                        chunk = infile.read(8 * 1024 * 1024)  # 8MB chunks
+                        if not chunk:
+                            break
+                        outfile.write(chunk)
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        st.error(f"Failed to combine part files: {e}")
+        return False
+
+def get_combined_file_size(part_files):
+    """Calculate total size of all part files in MB."""
+    total_bytes = sum(os.path.getsize(p) for p in part_files if os.path.exists(p))
+    return total_bytes / (1024 * 1024)
+
+# -----------------------------------------------------------------------------
+# Helper Functions - Timestep Discovery from Exodus Files
+# -----------------------------------------------------------------------------
+def get_exodus_timesteps(file_path):
+    """
+    Extract available timesteps from an Exodus (NetCDF) file.
+    Returns list of dicts: [{'index': 0, 'time_value': 0.0, 'label': 't=0.0'}, ...]
+    """
+    try:
+        import netCDF4
+        
+        with netCDF4.Dataset(file_path, 'r') as ds:
+            # Try common time variable names used by MOOSE/Exodus
+            time_var = None
+            for var_name in ['time_values', 'time', 'global_time_values', 'time_step']:
+                if var_name in ds.variables:
+                    time_var = ds.variables[var_name]
+                    break
+            
+            if time_var is None:
+                # Fallback: check for num_time_steps attribute
+                if hasattr(ds, 'num_time_steps'):
+                    n_steps = int(getattr(ds, 'num_time_steps'))
+                    return [
+                        {'index': i, 'time_value': float(i), 'label': f'Step {i}'}
+                        for i in range(n_steps)
+                    ]
+                return None
+            
+            # Extract time values
+            times = time_var[:]
+            return [
+                {'index': idx, 'time_value': float(tv), 'label': f't={float(tv):.4g} (step {idx})'}
+                for idx, tv in enumerate(times)
+            ]
+            
+    except ImportError:
+        st.warning("Install netCDF4 to access timestep information: `pip install netCDF4`")
+        return None
+    except Exception as e:
+        st.warning(f"Could not read timesteps from {os.path.basename(file_path)}: {e}")
+        return None
+
+def load_exodus_with_timestep(file_path, timestep_index=None):
+    """
+    Load Exodus file, optionally selecting a specific timestep.
+    meshio supports the time_step parameter for Exodus files.
+    """
+    try:
+        if timestep_index is not None:
+            return meshio.read(file_path, time_step=timestep_index)
+        return meshio.read(file_path)
+    except Exception as e:
+        st.error(f"Error loading Exodus file: {type(e).__name__}: {e}")
+        return None
+
+# -----------------------------------------------------------------------------
+# Helper Functions - File Discovery
+# -----------------------------------------------------------------------------
+def find_exodus_files(search_dir, recursive=True):
+    """
+    Recursively find all Exodus files AND part-file groups.
+    Returns list of dicts with file info.
+    """
+    exodus_extensions = ['.e', '.exo', '.exodus', '.out', '.ex2']
+    results = []
+    
+    if not os.path.exists(search_dir):
+        return results
+    
+    try:
+        if recursive:
+            for root, dirs, files in os.walk(search_dir):
+                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', '.git']]
+                for file in files:
+                    if file.startswith('.'):
+                        continue
+                    full_path = os.path.join(root, file)
+                    file_ext = os.path.splitext(file)[1].lower()
+                    
+                    # Check for part files
+                    if is_part_file(file):
+                        base_name = re.sub(r'\.part\d+$', '', file, flags=re.IGNORECASE)
+                        base_path = os.path.join(root, base_name)
+                        # Only add base path once (will be processed below)
+                        continue
+                    elif file_ext in exodus_extensions or re.match(r'\.e-s\d+$', file_ext):
+                        results.append({
+                            'path': full_path,
+                            'display_name': get_file_display_name(full_path, search_dir),
+                            'is_part_group': False,
+                            'part_files': None
+                        })
+        else:
+            for file in os.listdir(search_dir):
+                if file.startswith('.'):
+                    continue
+                full_path = os.path.join(search_dir, file)
+                file_ext = os.path.splitext(file)[1].lower()
+                
+                if is_part_file(file):
+                    continue
+                elif file_ext in exodus_extensions:
+                    results.append({
+                        'path': full_path,
+                        'display_name': get_file_display_name(full_path, search_dir),
+                        'is_part_group': False,
+                        'part_files': None
+                    })
+    except PermissionError as e:
+        st.warning(f"Permission denied accessing: {search_dir}")
+    except Exception as e:
+        st.warning(f"Error scanning directory: {e}")
+    
+    # Now find part-file groups and add them as separate entries
+    seen_bases = {r['path'] for r in results}
+    for root, dirs, files in ([(search_dir, [], os.listdir(search_dir))] if not recursive else os.walk(search_dir)):
+        for file in files:
+            if is_part_file(file):
+                base_name = re.sub(r'\.part\d+$', '', file, flags=re.IGNORECASE)
+                base_path = os.path.join(root, base_name)
+                
+                if base_path not in seen_bases:
+                    seen_bases.add(base_path)
+                    part_files = find_part_files_for_base(base_path)
+                    if part_files:
+                        total_size = get_combined_file_size(part_files)
+                        results.append({
+                            'path': base_path,
+                            'display_name': f"{get_file_display_name(base_path, search_dir)} ({len(part_files)} parts, {format_file_size(total_size)})",
+                            'is_part_group': True,
+                            'part_files': part_files,
+                            'total_size_mb': total_size
+                        })
+    
+    results.sort(key=lambda x: x['display_name'].lower())
+    return results
+
+def get_file_display_name(file_path, base_dir):
+    """Creates a user-friendly display name showing relative path."""
+    try:
+        rel_path = os.path.relpath(file_path, base_dir)
+        if os.path.dirname(rel_path):
+            return f"📁 {rel_path}"
+        return f"📄 {os.path.basename(file_path)}"
+    except ValueError:
+        return f"📄 {os.path.basename(file_path)}"
+    except Exception:
+        return os.path.basename(file_path)
 
 def get_file_size_mb(file_path):
     """Get file size in MB with error handling."""
     try:
-        return os.path.getsize(file_path) / (1024 * 1024)
+        size_bytes = os.path.getsize(file_path)
+        return size_bytes / (1024 * 1024)
     except OSError:
         return 0
 
-def find_exodus_files_grouped(search_dir):
-    """
-    Recursively find all Exodus files and split-file groups in the given directory.
-    Returns a list of groups, each a dict with keys:
-        display_name : str  – user‑friendly name (includes part count and total size)
-        base_name    : str  – base filename (e.g., 'solidtwo.e')
-        directory    : str  – directory containing the files
-        part_files   : list – sorted list of part file paths (empty for single file)
-        single_file  : str or None – path if not split
-        total_size_mb: float – sum of file sizes in MB
-    """
-    exodus_extensions = ['.e', '.exo', '.exodus', '.out', '.ex2']
-    regular_files = []
-    part_files = []
-
-    if not os.path.exists(search_dir):
-        return []
-
-    for root, dirs, files in os.walk(search_dir):
-        # Skip hidden directories
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
-        for file in files:
-            if file.startswith('.'):
-                continue
-            full_path = os.path.join(root, file)
-            if is_part_file(file):
-                part_files.append(full_path)
-            else:
-                ext = os.path.splitext(file)[1].lower()
-                if ext in exodus_extensions:
-                    regular_files.append(full_path)
-
-    # Group part files by (directory, base_name)
-    part_groups = {}
-    for pf in part_files:
-        dirname = os.path.dirname(pf)
-        base = get_base_name_from_part(os.path.basename(pf))
-        key = (dirname, base)
-        part_groups.setdefault(key, []).append(pf)
-
-    # Sort part files numerically within each group
-    for key in part_groups:
-        part_groups[key].sort(key=lambda x: int(re.search(r'\.part(\d+)$', x).group(1)))
-
-    # Build groups from part files
-    groups = []
-    for (dirname, base), part_list in part_groups.items():
-        total_size = sum(get_file_size_mb(p) for p in part_list)
-        display_path = os.path.join(dirname, base) if dirname != '.' else base
-        groups.append({
-            'display_name': f"{display_path} ({len(part_list)} parts, {total_size:.1f} MB)",
-            'base_name': base,
-            'directory': dirname,
-            'part_files': part_list,
-            'single_file': None,
-            'total_size_mb': total_size
-        })
-
-    # Add regular files that are NOT already represented by a part group
-    bases_with_parts = {(dirname, base) for (dirname, base) in part_groups.keys()}
-    for rf in regular_files:
-        dirname = os.path.dirname(rf)
-        basename = os.path.basename(rf)
-        if (dirname, basename) not in bases_with_parts:
-            size_mb = get_file_size_mb(rf)
-            display_path = os.path.join(dirname, basename) if dirname != '.' else basename
-            groups.append({
-                'display_name': display_path,
-                'base_name': basename,
-                'directory': dirname,
-                'part_files': [],
-                'single_file': rf,
-                'total_size_mb': size_mb
-            })
-
-    # Sort groups alphabetically by display name
-    groups.sort(key=lambda g: g['display_name'].lower())
-    return groups
-
-def combine_parts(part_files, output_path):
-    """
-    Concatenate part files (in order) into a single output file.
-    Returns True on success, False on failure.
-    """
-    try:
-        with open(output_path, 'wb') as outfile:
-            for part in part_files:
-                with open(part, 'rb') as infile:
-                    outfile.write(infile.read())
-        return True
-    except Exception as e:
-        st.error(f"Failed to combine parts: {e}")
-        return False
+def format_file_size(size_mb):
+    """Format file size with appropriate units."""
+    if size_mb < 1:
+        return f"{size_mb * 1024:.1f} KB"
+    elif size_mb < 100:
+        return f"{size_mb:.2f} MB"
+    else:
+        return f"{size_mb:.1f} MB"
 
 # -----------------------------------------------------------------------------
-# Helper Functions - Mesh Loading
+# Helper Functions - Mesh Loading & Analysis
 # -----------------------------------------------------------------------------
-def load_exodus_data(file_path):
+def load_exodus_data(file_path, time_step=None):
     """
     Reads an Exodus file using meshio.
-    Returns meshio mesh object or None on error.
+    Args:
+        file_path: Path to Exodus file
+        time_step: Optional time step index to load
+    Returns:
+        meshio mesh object or None on error
     """
     if not os.path.exists(file_path):
         st.error(f"File not found: {file_path}")
         return None
-
+    
     try:
         with st.spinner(f"Reading {os.path.basename(file_path)}..."):
-            mesh = meshio.read(file_path)
+            mesh = load_exodus_with_timestep(file_path, timestep_index=time_step)
+            
+            if mesh is None:
+                return None
+                
+            if mesh.points is None or len(mesh.points) == 0:
+                st.warning("Mesh has no points. File may be empty or corrupted.")
+                return None
+            
+            if not mesh.cells or all(c.data is None or len(c.data) == 0 for c in mesh.cells):
+                st.warning("Mesh has no cells. Cannot visualize topology.")
+                return mesh
+            
             return mesh
+            
     except ImportError as e:
-        st.error(f"Missing dependency: {e}")
-        st.info("Try: `pip install netCDF4 h5py` or use conda: `conda install -c conda-forge seacas`")
+        error_msg = str(e).lower()
+        if 'netcdf' in error_msg or 'netcdf4' in error_msg:
+            st.error("Missing NetCDF support for Exodus files")
+            st.info("Install with: `pip install netCDF4` or `conda install -c conda-forge netcdf4`")
+        elif 'h5py' in error_msg:
+            st.error("Missing h5py for HDF5-based Exodus files")
+            st.info("Install with: `pip install h5py`")
+        else:
+            st.error(f"Missing dependency: {e}")
         return None
     except Exception as e:
-        st.error(f"Error reading file: {type(e).__name__}: {e}")
-        st.info("Ensure the file is a valid MOOSE Exodus output file.")
+        error_type = type(e).__name__
+        error_msg = str(e)
+        if 'NC_' in error_msg or 'NetCDF' in error_msg:
+            st.error(f"NetCDF error: {error_msg}")
+            st.info("Try: `pip install --upgrade netCDF4`")
+        elif 'HDF5' in error_msg or 'hdf5' in error_msg.lower():
+            st.error(f"HDF5 error: {error_msg}")
+            st.info("Try: `pip install h5py` or check file integrity")
+        elif 'format' in error_msg.lower() or 'magic' in error_msg.lower():
+            st.error(f"File format error: {error_msg}")
+            st.info("Ensure this is a valid MOOSE Exodus output file")
+        else:
+            st.error(f"Error reading file ({error_type}): {error_msg}")
+        with st.expander("Technical Details", expanded=False):
+            st.code(f"File: {file_path}\nError: {error_type}: {error_msg}", language="text")
         return None
+
+def analyze_mesh(meshio_mesh):
+    """Analyze mesh and return statistics dictionary."""
+    if meshio_mesh is None:
+        return {}
+    
+    stats = {
+        'n_points': len(meshio_mesh.points) if meshio_mesh.points is not None else 0,
+        'n_cells': 0,
+        'cell_types': {},
+        'dimensions': None,
+        'bounds': None,
+        'point_vars': [],
+        'cell_vars': [],
+        'field_info': {}
+    }
+    
+    if meshio_mesh.cells:
+        for cell_block in meshio_mesh.cells:
+            if cell_block and cell_block.data is not None:
+                cell_type = cell_block.type or 'unknown'
+                n_cells = len(cell_block.data)
+                stats['n_cells'] += n_cells
+                stats['cell_types'][cell_type] = stats['cell_types'].get(cell_type, 0) + n_cells
+    
+    if meshio_mesh.points is not None and len(meshio_mesh.points) > 0:
+        points = np.asarray(meshio_mesh.points)
+        stats['dimensions'] = points.shape[1] if points.ndim > 1 else 1
+        stats['bounds'] = {
+            'x': (float(np.min(points[:, 0])), float(np.max(points[:, 0]))),
+            'y': (float(np.min(points[:, 1])), float(np.max(points[:, 1]))) if points.shape[1] > 1 else None,
+            'z': (float(np.min(points[:, 2])), float(np.max(points[:, 2]))) if points.shape[1] > 2 else None,
+        }
+    
+    point_data = getattr(meshio_mesh, 'point_data', None) or {}
+    cell_data = getattr(meshio_mesh, 'cell_data', None) or {}
+    
+    for var_name, var_data in point_data.items():
+        if var_name and isinstance(var_name, str):
+            try:
+                arr = np.asarray(var_data)
+                stats['point_vars'].append(var_name)
+                stats['field_info'][var_name] = {
+                    'location': 'point',
+                    'shape': arr.shape[1:] if arr.ndim > 1 else (),
+                    'dtype': str(arr.dtype),
+                    'range': (float(np.min(arr)), float(np.max(arr))) if arr.size > 0 else None
+                }
+            except Exception:
+                stats['point_vars'].append(var_name)
+    
+    for var_name, var_data in cell_data.items():
+        if var_name and isinstance(var_name, str):
+            try:
+                if isinstance(var_data, list):
+                    arrays = [np.asarray(a) for a in var_data if a is not None]
+                    if arrays:
+                        arr = arrays[0]
+                        stats['cell_vars'].append(var_name)
+                        stats['field_info'][var_name] = {
+                            'location': 'cell',
+                            'shape': arr.shape[1:] if arr.ndim > 1 else (),
+                            'dtype': str(arr.dtype),
+                            'range': (float(np.min(arr)), float(np.max(arr))) if arr.size > 0 else None
+                        }
+                else:
+                    arr = np.asarray(var_data)
+                    stats['cell_vars'].append(var_name)
+                    stats['field_info'][var_name] = {
+                        'location': 'cell',
+                        'shape': arr.shape[1:] if arr.ndim > 1 else (),
+                        'dtype': str(arr.dtype),
+                        'range': (float(np.min(arr)), float(np.max(arr))) if arr.size > 0 else None
+                    }
+            except Exception:
+                stats['cell_vars'].append(var_name)
+    
+    return stats
 
 # -----------------------------------------------------------------------------
 # Helper Functions - Surface Extraction for Plotly
 # -----------------------------------------------------------------------------
-def extract_mesh_surfaces(meshio_mesh):
-    """
-    Extract surface triangles from mesh for Plotly visualization.
-    Works with tetrahedra, hexahedra, triangles, quads, wedges, and pyramids.
-
-    Returns:
-        tuple: (points, faces, face_centers) or (None, None, None) on failure
-    """
+def extract_mesh_surfaces(meshio_mesh, cell_types_filter=None):
+    """Extract surface triangles from mesh for Plotly visualization."""
     if meshio_mesh is None:
         return None, None, None
-
+    
     points = meshio_mesh.points
-
     if points is None or len(points) == 0:
         return None, None, None
-
-    # Collect all faces from cells
+    
     faces = []
-
-    # Check if cells exist
-    if not meshio_mesh.cells or len(meshio_mesh.cells) == 0:
-        st.warning("No cell data found in mesh. Cannot extract surfaces.")
+    face_cell_map = []
+    
+    if not meshio_mesh.cells:
         return None, None, None
-
-    for cell_block in meshio_mesh.cells:
-        if cell_block is None:
+    
+    for block_idx, cell_block in enumerate(meshio_mesh.cells):
+        if cell_block is None or cell_block.data is None:
             continue
-
         cell_type = cell_block.type
         cells = cell_block.data
-
         if cells is None or len(cells) == 0:
             continue
-
+        if cell_types_filter and cell_type not in cell_types_filter:
+            continue
+        
         try:
             if cell_type in ['tetra', 'tetrahedron']:
-                # Each tetrahedron has 4 triangular faces
-                for cell in cells:
+                for cell_idx, cell in enumerate(cells):
                     if len(cell) >= 4:
                         tetra_faces = [
                             [cell[0], cell[1], cell[2]],
@@ -199,96 +553,92 @@ def extract_mesh_surfaces(meshio_mesh):
                             [cell[0], cell[2], cell[3]],
                             [cell[1], cell[2], cell[3]]
                         ]
-                        faces.extend(tetra_faces)
-
-            elif cell_type in ['hexahedron', 'hex', 'hexa']:
-                # Each hexahedron has 6 quadrilateral faces
-                for cell in cells:
+                        for face in tetra_faces:
+                            faces.append(face)
+                            face_cell_map.append((block_idx, cell_idx))
+            
+            elif cell_type in ['hexahedron', 'hex', 'hexa', 'hexahedron20', 'hexahedron27']:
+                for cell_idx, cell in enumerate(cells):
                     if len(cell) >= 8:
                         hex_faces = [
-                            [cell[0], cell[1], cell[2], cell[3]], # bottom
-                            [cell[4], cell[5], cell[6], cell[7]], # top
-                            [cell[0], cell[1], cell[5], cell[4]], # front
-                            [cell[2], cell[3], cell[7], cell[6]], # back
-                            [cell[0], cell[3], cell[7], cell[4]], # left
-                            [cell[1], cell[2], cell[6], cell[5]]  # right
+                            [cell[0], cell[1], cell[2], cell[3]],
+                            [cell[4], cell[5], cell[6], cell[7]],
+                            [cell[0], cell[1], cell[5], cell[4]],
+                            [cell[2], cell[3], cell[7], cell[6]],
+                            [cell[0], cell[3], cell[7], cell[4]],
+                            [cell[1], cell[2], cell[6], cell[5]]
                         ]
                         for quad in hex_faces:
                             faces.append([quad[0], quad[1], quad[2]])
                             faces.append([quad[0], quad[2], quad[3]])
-
-            elif cell_type in ['triangle', 'tri']:
-                for cell in cells:
+                            face_cell_map.extend([(block_idx, cell_idx), (block_idx, cell_idx)])
+            
+            elif cell_type in ['triangle', 'tri', 'triangle6', 'triangle7']:
+                for cell_idx, cell in enumerate(cells):
                     if len(cell) >= 3:
                         faces.append([cell[0], cell[1], cell[2]])
-
+                        face_cell_map.append((block_idx, cell_idx))
+            
             elif cell_type in ['quad', 'quadrilateral', 'quad8', 'quad9']:
-                for cell in cells:
+                for cell_idx, cell in enumerate(cells):
                     if len(cell) >= 4:
                         faces.append([cell[0], cell[1], cell[2]])
                         faces.append([cell[0], cell[2], cell[3]])
-
-            elif cell_type in ['wedge', 'triangular_prism']:
-                for cell in cells:
+                        face_cell_map.extend([(block_idx, cell_idx), (block_idx, cell_idx)])
+            
+            elif cell_type in ['wedge', 'triangular_prism', 'wedge15', 'wedge18']:
+                for cell_idx, cell in enumerate(cells):
                     if len(cell) >= 6:
-                        # Triangle faces
-                        faces.append([cell[0], cell[1], cell[2]]) # bottom
-                        faces.append([cell[3], cell[5], cell[4]]) # top (reversed for normal)
-                        # Quad faces split into triangles
-                        faces.append([cell[0], cell[1], cell[4]])
-                        faces.append([cell[0], cell[4], cell[3]])
-                        faces.append([cell[1], cell[2], cell[5]])
-                        faces.append([cell[1], cell[5], cell[4]])
-                        faces.append([cell[2], cell[0], cell[3]])
-                        faces.append([cell[2], cell[3], cell[5]])
-
-            elif cell_type in ['pyramid', 'pyra']:
-                for cell in cells:
+                        faces.append([cell[0], cell[1], cell[2]])
+                        faces.append([cell[3], cell[5], cell[4]])
+                        face_cell_map.extend([(block_idx, cell_idx), (block_idx, cell_idx)])
+                        wedge_faces = [
+                            [cell[0], cell[1], cell[4], cell[3]],
+                            [cell[1], cell[2], cell[5], cell[4]],
+                            [cell[2], cell[0], cell[3], cell[5]]
+                        ]
+                        for quad in wedge_faces:
+                            faces.append([quad[0], quad[1], quad[2]])
+                            faces.append([quad[0], quad[2], quad[3]])
+                            face_cell_map.extend([(block_idx, cell_idx), (block_idx, cell_idx)])
+            
+            elif cell_type in ['pyramid', 'pyra', 'pyramid13']:
+                for cell_idx, cell in enumerate(cells):
                     if len(cell) >= 5:
-                        # Quad base split into 2 triangles
                         faces.append([cell[0], cell[1], cell[2]])
                         faces.append([cell[0], cell[2], cell[3]])
-                        # Triangle sides
-                        faces.append([cell[0], cell[1], cell[4]])
-                        faces.append([cell[1], cell[2], cell[4]])
-                        faces.append([cell[2], cell[3], cell[4]])
-                        faces.append([cell[3], cell[0], cell[4]])
-
-            elif cell_type in ['line', 'line2', 'line3']:
-                # Skip 1D elements for 3D visualization
+                        face_cell_map.extend([(block_idx, cell_idx), (block_idx, cell_idx)])
+                        for tri in [[cell[0], cell[1], cell[4]],
+                                    [cell[1], cell[2], cell[4]],
+                                    [cell[2], cell[3], cell[4]],
+                                    [cell[3], cell[0], cell[4]]]:
+                            faces.append(tri)
+                            face_cell_map.append((block_idx, cell_idx))
+            
+            elif cell_type in ['line', 'line2', 'line3', 'vertex']:
                 continue
-
+            
             else:
-                # Unknown cell type - skip with warning (only once)
-                if not hasattr(extract_mesh_surfaces, '_warned_types'):
-                    extract_mesh_surfaces._warned_types = set()
-                if cell_type not in extract_mesh_surfaces._warned_types:
-                    extract_mesh_surfaces._warned_types.add(cell_type)
-                    st.warning(f"Skipping unsupported cell type: {cell_type}")
-
-        except (IndexError, TypeError, ValueError) as e:
-            st.warning(f"Error processing {cell_type} cells: {e}")
+                if not hasattr(extract_mesh_surfaces, '_logged_types'):
+                    extract_mesh_surfaces._logged_types = set()
+                if cell_type not in extract_mesh_surfaces._logged_types:
+                    extract_mesh_surfaces._logged_types.add(cell_type)
+        
+        except (IndexError, TypeError, ValueError, KeyError) as e:
             continue
-
+    
     if len(faces) == 0:
-        st.warning("No valid faces extracted from mesh. Check cell types in your Exodus file.")
         return None, None, None
-
+    
     try:
         faces = np.array(faces, dtype=np.int32)
-
-        # Validate faces array
         if faces.ndim != 2 or faces.shape[1] != 3:
-            st.error(f"Invalid faces array shape: {faces.shape}")
             return None, None, None
-
-        # Calculate face centers for scalar interpolation
-        face_centers = np.mean(points[faces], axis=1)
-
-        return points, faces, face_centers
-
+        sorted_faces = np.sort(faces, axis=1)
+        unique_faces, unique_indices = np.unique(sorted_faces, axis=0, return_index=True)
+        faces = faces[unique_indices]
+        return points, faces, face_cell_map
     except Exception as e:
-        st.error(f"Error converting faces to array: {e}")
         return None, None, None
 
 # -----------------------------------------------------------------------------
@@ -296,44 +646,31 @@ def extract_mesh_surfaces(meshio_mesh):
 # -----------------------------------------------------------------------------
 def create_plotly_mesh(points, faces, values=None, color_map='Viridis',
                        opacity=0.9, show_edges=False, title="Mesh",
-                       show_scalar_bar=True):
-    """
-    Create a Plotly 3D mesh visualization.
-    """
-    if points is None or faces is None:
+                       show_scalar_bar=True, camera_preset='isometric'):
+    """Create a Plotly 3D mesh visualization with extensive customization."""
+    if points is None or faces is None or len(points) == 0 or len(faces) == 0:
         fig = go.Figure()
         fig.add_annotation(
-            text="⚠️ No mesh data available for visualization",
-            xref="paper", yref="paper",
-            x=0.5, y=0.5, showarrow=False,
-            font=dict(size=16, color="gray")
+            text="No mesh data available for visualization",
+            xref="paper", yref="paper", x=0.5, y=0.5,
+            showarrow=False, font=dict(size=16, color="gray")
         )
         fig.update_layout(
-            scene=dict(
-                xaxis_title='X', yaxis_title='Y', zaxis_title='Z',
-                aspectmode='data'
-            ),
-            height=600,
-            title=title
+            scene=dict(xaxis_title='X', yaxis_title='Y', zaxis_title='Z', aspectmode='data'),
+            height=600, title=title, template='plotly_white'
         )
         return fig
-
-    if len(points) == 0 or len(faces) == 0:
-        return create_plotly_mesh(None, None, None, title=title)
-
+    
     try:
-        i = faces[:, 0]
-        j = faces[:, 1]
-        k = faces[:, 2]
-    except IndexError:
-        st.error("Invalid faces array format")
+        i, j, k = faces[:, 0], faces[:, 1], faces[:, 2]
+    except (IndexError, TypeError):
         return create_plotly_mesh(None, None, None, title=title)
-
+    
     intensity = None
     colorscale = None
     showscale = False
     colorbar = None
-
+    
     if values is not None and len(values) > 0:
         try:
             values = np.asarray(values).flatten()
@@ -343,169 +680,252 @@ def create_plotly_mesh(points, faces, values=None, color_map='Viridis',
                 showscale = show_scalar_bar
                 if show_scalar_bar:
                     colorbar = dict(
-                        title=dict(text=title, font=dict(size=12)),
+                        title=dict(text=title, font=dict(size=11)),
                         thickness=20,
-                        len=0.5
+                        len=0.6,
+                        x=0.95,
+                        y=0.5
                     )
-            else:
-                st.warning(f"Value count ({len(values)}) doesn't match face count ({len(faces)}). Showing geometry only.")
-        except Exception as e:
-            st.warning(f"Could not apply scalar values: {e}")
-
+        except Exception:
+            pass
+    
     mesh_trace = go.Mesh3d(
-        x=points[:, 0],
-        y=points[:, 1],
-        z=points[:, 2],
-        i=i,
-        j=j,
-        k=k,
+        x=points[:, 0], y=points[:, 1], z=points[:, 2],
+        i=i, j=j, k=k,
         intensity=intensity,
         colorscale=colorscale,
         opacity=opacity,
         showscale=showscale,
         colorbar=colorbar,
         flatshading=True,
-        lighting=dict(ambient=0.5, diffuse=0.8, roughness=0.5, specular=0.2),
+        lighting=dict(ambient=0.5, diffuse=0.8, roughness=0.4, specular=0.3),
         lightposition=dict(x=100, y=100, z=100),
-        name='Mesh'
+        name='Mesh',
+        hovertemplate=(
+            "<b>Face</b><br>" +
+            "X: %{x:.3f}<br>" +
+            "Y: %{y:.3f}<br>" +
+            "Z: %{z:.3f}<br>" +
+            (f"Value: %{{intensity:.4g}}<br>" if intensity is not None else "") +
+            "<extra></extra>"
+        )
     )
-
+    
     fig = go.Figure(data=[mesh_trace])
-
-    # Add edge lines if requested and mesh is not too large
-    if show_edges and len(faces) < 50000:
-        edge_x = []
-        edge_y = []
-        edge_z = []
-
+    
+    if show_edges and len(faces) < 30000:
+        edge_x, edge_y, edge_z = [], [], []
         for face in faces:
-            for idx1, idx2 in [(0, 1), (1, 2), (2, 0)]:
+            for idx1, idx2 in [(0,1), (1,2), (2,0)]:
                 try:
-                    p1 = points[face[idx1]]
-                    p2 = points[face[idx2]]
+                    p1, p2 = points[face[idx1]], points[face[idx2]]
                     edge_x.extend([p1[0], p2[0], None])
                     edge_y.extend([p1[1], p2[1], None])
                     edge_z.extend([p1[2], p2[2], None])
                 except (IndexError, TypeError):
                     continue
-
-        if len(edge_x) > 0:
+        if edge_x:
             fig.add_trace(go.Scatter3d(
                 x=edge_x, y=edge_y, z=edge_z,
                 mode='lines',
                 line=dict(color='black', width=0.5),
                 name='Edges',
-                opacity=0.6,
-                showlegend=False
+                opacity=0.5,
+                showlegend=False,
+                hoverinfo='skip'
             ))
-
+    
+    camera_presets = {
+        'isometric': dict(eye=dict(x=1.5, y=1.5, z=1.5)),
+        'top': dict(eye=dict(x=0, y=0, z=2.5)),
+        'front': dict(eye=dict(x=0, y=2.5, z=0)),
+        'side': dict(eye=dict(x=2.5, y=0, z=0)),
+        'corner': dict(eye=dict(x=2, y=2, z=1)),
+    }
+    camera = camera_presets.get(camera_preset, camera_presets['isometric'])
+    
     fig.update_layout(
         scene=dict(
-            xaxis_title='X',
-            yaxis_title='Y',
-            zaxis_title='Z',
+            xaxis_title='X', yaxis_title='Y', zaxis_title='Z',
             aspectmode='data',
-            camera=dict(
-                eye=dict(x=1.5, y=1.5, z=1.5),
-                up=dict(x=0, y=0, z=1)
-            ),
+            camera=camera,
             bgcolor='white'
         ),
         height=600,
         margin=dict(l=0, r=0, t=50, b=0),
         title=dict(text=title, x=0.5, xanchor='center', font=dict(size=18)),
         hovermode='closest',
+        template='plotly_white',
         paper_bgcolor='white',
         plot_bgcolor='white'
     )
-
+    
     return fig
+
+def create_variable_histogram(values, var_name, nbins=50):
+    """Create a histogram of variable values."""
+    if values is None or len(values) == 0:
+        return None
+    try:
+        values = np.asarray(values).flatten()
+        values = values[np.isfinite(values)]
+        if len(values) == 0:
+            return None
+        fig = go.Figure(data=[
+            go.Histogram(
+                x=values,
+                nbinsx=nbins,
+                marker_color='#667eea',
+                opacity=0.7,
+                name=var_name
+            )
+        ])
+        fig.update_layout(
+            title=f"Distribution: {var_name}",
+            xaxis_title="Value",
+            yaxis_title="Count",
+            height=300,
+            margin=dict(l=40, r=20, t=40, b=40),
+            template='plotly_white'
+        )
+        return fig
+    except Exception:
+        return None
 
 # -----------------------------------------------------------------------------
 # Helper Functions - Format Conversion for ParaView
 # -----------------------------------------------------------------------------
-def convert_to_vtu(meshio_mesh, output_path):
-    if meshio_mesh is None:
-        return False
+def get_meshio_write_formats():
+    """Dynamically get supported write formats from meshio."""
     try:
-        meshio.write(output_path, meshio_mesh, file_format="vtu")
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
-    except ImportError as e:
-        if 'h5py' in str(e).lower():
-            st.error("VTU export requires h5py. Install with: pip install h5py")
+        import meshio
+        if hasattr(meshio, '_format_registry'):
+            return set(meshio._format_registry.write.keys())
+        elif hasattr(meshio, 'extension_to_filetype'):
+            return set(meshio.extension_to_filetype.values())
         else:
-            st.error(f"VTU export error: {e}")
-        return False
-    except Exception as e:
-        st.error(f"VTU conversion error: {type(e).__name__}: {e}")
-        return False
+            return {'vtu', 'vtk', 'stl', 'ply', 'xdmf', 'exodus'}
+    except Exception:
+        return {'vtu', 'vtk', 'stl', 'ply', 'xdmf', 'exodus'}
 
-def convert_to_vtp(meshio_mesh, output_path):
+def convert_mesh_format(meshio_mesh, output_path, file_format):
+    """Convert mesh to specified format using meshio."""
     if meshio_mesh is None:
-        return False
+        return False, "No mesh data to export", 0
+    
+    supported = get_meshio_write_formats()
+    if file_format not in supported:
+        return False, f"Format '{file_format}' not supported by meshio. Available: {sorted(supported)}", 0
+    
+    if file_format not in SUPPORTED_EXPORT_FORMATS:
+        return False, f"Unknown format configuration: {file_format}", 0
+    
+    format_info = SUPPORTED_EXPORT_FORMATS[file_format]
+    
+    if 'requires' in format_info:
+        for dep in format_info['requires']:
+            try:
+                __import__(dep)
+            except ImportError:
+                return False, f"{format_info['name']} requires '{dep}': pip install {dep}", 0
+    
     try:
-        points, faces, _ = extract_mesh_surfaces(meshio_mesh)
-        if points is None or faces is None:
-            st.warning("Could not extract surface for VTP export")
-            return False
-        triangle_cells = meshio.CellBlock('triangle', faces)
-        surface_mesh = meshio.Mesh(points=points, cells=[triangle_cells])
-        if hasattr(meshio_mesh, 'point_data') and meshio_mesh.point_data:
-            surface_mesh.point_data = meshio_mesh.point_data
-        meshio.write(output_path, surface_mesh, file_format="vtp")
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        if format_info.get('surface_only', False):
+            points, faces, _ = extract_mesh_surfaces(meshio_mesh)
+            if points is None or faces is None or len(faces) == 0:
+                return False, "Could not extract surface mesh for export", 0
+            triangle_cells = meshio.CellBlock('triangle', faces)
+            export_mesh = meshio.Mesh(points=points, cells=[triangle_cells])
+            if file_format == 'ply' and hasattr(meshio_mesh, 'point_data') and meshio_mesh.point_data:
+                scalar_point_data = {}
+                for key, val in meshio_mesh.point_data.items():
+                    try:
+                        arr = np.asarray(val)
+                        if arr.ndim == 1 or (arr.ndim == 2 and arr.shape[1] <= 3):
+                            scalar_point_data[key] = arr
+                    except Exception:
+                        continue
+                if scalar_point_data:
+                    export_mesh.point_data = scalar_point_data
+        else:
+            export_mesh = meshio_mesh
+        
+        meshio.write(output_path, export_mesh, file_format=file_format)
+        
+        if os.path.exists(output_path):
+            size_mb = get_file_size_mb(output_path)
+            if size_mb > 0:
+                return True, f"Exported: {format_file_size(size_mb)}", size_mb
+            return False, "Output file is empty", 0
+        return False, "Failed to create output file", 0
+        
+    except ImportError as e:
+        return False, f"Missing dependency: {e}", 0
     except Exception as e:
-        st.error(f"VTP conversion error: {type(e).__name__}: {e}")
-        return False
+        return False, f"{type(e).__name__}: {str(e)[:200]}", 0
 
-def convert_to_vtk(meshio_mesh, output_path):
-    if meshio_mesh is None:
-        return False
+def export_variable_csv(meshio_mesh, variable_name, output_path):
+    """Export variable data to CSV with coordinates."""
+    if meshio_mesh is None or not variable_name:
+        return False, "No data to export"
+    
     try:
-        meshio.write(output_path, meshio_mesh, file_format="vtk")
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
-    except Exception as e:
-        st.error(f"VTK conversion error: {type(e).__name__}: {e}")
-        return False
-
-def convert_to_xdmf(meshio_mesh, output_path):
-    if meshio_mesh is None:
-        return False
-    try:
-        import h5py
-        meshio.write(output_path, meshio_mesh, file_format="xdmf")
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+        import pandas as pd
+        point_data = getattr(meshio_mesh, 'point_data', None) or {}
+        cell_data = getattr(meshio_mesh, 'cell_data', None) or {}
+        
+        if variable_name in point_data:
+            data = np.asarray(point_data[variable_name])
+            location = 'point'
+            coords = meshio_mesh.points
+        elif variable_name in cell_data:
+            cdata = cell_data[variable_name]
+            if isinstance(cdata, list):
+                data = np.concatenate([np.asarray(a) for a in cdata if a is not None])
+            else:
+                data = np.asarray(cdata)
+            location = 'cell'
+            coords = None
+        else:
+            return False, f"Variable '{variable_name}' not found in mesh"
+        
+        if data.ndim > 1:
+            if data.shape[1] <= 3:
+                df = pd.DataFrame(data, columns=[f'{variable_name}_{i}' for i in range(data.shape[1])])
+                df[f'{variable_name}_mag'] = np.linalg.norm(data, axis=1)
+            else:
+                df = pd.DataFrame(data)
+                df.columns = [f'{variable_name}_{i}' for i in range(data.shape[1])]
+        else:
+            df = pd.DataFrame({variable_name: data})
+        
+        if location == 'point' and coords is not None:
+            coord_df = pd.DataFrame(coords[:, :3], columns=['x', 'y', 'z'])
+            df = pd.concat([coord_df, df], axis=1)
+        
+        df.insert(0, 'index', range(len(df)))
+        df.to_csv(output_path, index=False)
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True, f"Exported {len(df)} rows"
+        return False, "Empty output"
+        
     except ImportError:
-        return False
+        return False, "pandas required: pip install pandas"
     except Exception as e:
-        st.error(f"XDMF conversion error: {type(e).__name__}: {e}")
-        return False
-
-def convert_to_stl(meshio_mesh, output_path):
-    if meshio_mesh is None:
-        return False
-    try:
-        points, faces, _ = extract_mesh_surfaces(meshio_mesh)
-        if points is None or faces is None:
-            return False
-        triangle_cells = meshio.CellBlock('triangle', faces)
-        surface_mesh = meshio.Mesh(points=points, cells=[triangle_cells])
-        meshio.write(output_path, surface_mesh, file_format="stl")
-        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
-    except Exception as e:
-        st.error(f"STL conversion error: {type(e).__name__}: {e}")
-        return False
+        return False, f"{type(e).__name__}: {e}"
 
 # -----------------------------------------------------------------------------
 # Helper Functions - Data Processing
 # -----------------------------------------------------------------------------
-def get_variable_values(meshio_mesh, variable_name, faces):
-    if variable_name is None or faces is None:
+def get_variable_values(meshio_mesh, variable_name, faces, face_cell_map=None):
+    """Extract scalar values for a variable, mapped to faces."""
+    if variable_name is None or faces is None or len(faces) == 0:
         return None
-
+    
     point_data = getattr(meshio_mesh, 'point_data', None) or {}
     cell_data = getattr(meshio_mesh, 'cell_data', None) or {}
-
+    
     if variable_name in point_data:
         point_values = point_data[variable_name]
         if point_values is None:
@@ -516,374 +936,615 @@ def get_variable_values(meshio_mesh, variable_name, faces):
         try:
             face_values = np.mean(point_values[faces], axis=1)
             return face_values
-        except (IndexError, TypeError) as e:
-            st.warning(f"Could not interpolate point data: {e}")
+        except (IndexError, TypeError, ValueError):
             return None
-
+    
     elif variable_name in cell_data:
         cell_values = cell_data[variable_name]
         if cell_values is None:
             return None
         if isinstance(cell_values, list):
-            arrays = [np.asarray(arr) for arr in cell_values if arr is not None]
-            if len(arrays) == 0:
+            arrays = [np.asarray(a) for a in cell_values if a is not None]
+            if not arrays:
                 return None
             cell_values = np.concatenate(arrays)
         else:
             cell_values = np.asarray(cell_values)
         if cell_values.ndim > 1 and cell_values.shape[1] > 1:
             cell_values = np.linalg.norm(cell_values, axis=1)
-        total_cells = sum(len(block.data) for block in meshio_mesh.cells if block.data is not None)
-        if total_cells == 0:
-            return None
-        total_faces = len(faces)
-        if total_faces == 0:
-            return None
-
-        # Simplified mapping (repeat cell values for its faces)
-        if len(cell_values) == total_cells:
-            face_values = np.zeros(total_faces)
-            face_idx = 0
-            for cell_block in meshio_mesh.cells:
-                if cell_block.data is None:
-                    continue
-                n_block_cells = len(cell_block.data)
-                if cell_block.type in ['tetra', 'tetrahedron']:
-                    faces_per_this_cell = 4
-                elif cell_block.type in ['hexahedron', 'hex', 'hexa']:
-                    faces_per_this_cell = 12
-                elif cell_block.type in ['triangle', 'tri']:
-                    faces_per_this_cell = 1
-                elif cell_block.type in ['quad', 'quadrilateral']:
-                    faces_per_this_cell = 2
-                else:
-                    faces_per_this_cell = 4
-                for cell_idx in range(n_block_cells):
-                    if face_idx + faces_per_this_cell <= total_faces:
-                        face_values[face_idx:face_idx+faces_per_this_cell] = cell_values[
-                            sum(len(cb.data) for cb in meshio_mesh.cells if cb.data is not None and cb != cell_block) + cell_idx
-                        ]
-                        face_idx += faces_per_this_cell
-            return face_values if np.any(face_values) else None
-
-        if len(cell_values) == total_faces:
-            return cell_values
+        
+        if face_cell_map and len(face_cell_map) == len(faces):
+            face_values = np.zeros(len(faces))
+            for face_idx, (block_idx, cell_idx) in enumerate(face_cell_map):
+                global_idx = 0
+                for bi, cb in enumerate(meshio_mesh.cells):
+                    if cb and cb.data is not None:
+                        if bi < block_idx:
+                            global_idx += len(cb.data)
+                        elif bi == block_idx:
+                            global_idx += cell_idx
+                            break
+                if 0 <= global_idx < len(cell_values):
+                    face_values[face_idx] = cell_values[global_idx]
+            return face_values
+        
+        total_cells = sum(len(cb.data) for cb in meshio_mesh.cells if cb and cb.data is not None)
+        if total_cells > 0 and len(cell_values) == total_cells:
+            faces_per_cell = max(1, len(faces) // total_cells)
+            face_values = np.repeat(cell_values, faces_per_cell)
+            if len(face_values) > len(faces):
+                face_values = face_values[:len(faces)]
+            elif len(face_values) < len(faces):
+                face_values = np.pad(face_values, (0, len(faces) - len(face_values)), mode='edge')
+            return face_values
         return None
-
+    
     return None
 
 def get_available_variables(meshio_mesh):
+    """Get list of available variables with metadata."""
     if meshio_mesh is None:
         return [], [], []
     point_data = getattr(meshio_mesh, 'point_data', None) or {}
     cell_data = getattr(meshio_mesh, 'cell_data', None) or {}
-    point_vars = [v for v in point_data.keys() if v and isinstance(v, str)]
-    cell_vars = [v for v in cell_data.keys() if v and isinstance(v, str)]
-    all_vars = point_vars + cell_vars
-    return point_vars, cell_vars, all_vars
+    point_vars = sorted([v for v in point_data.keys() if v and isinstance(v, str)])
+    cell_vars = sorted([v for v in cell_data.keys() if v and isinstance(v, str)])
+    return point_vars, cell_vars, point_vars + cell_vars
 
 # -----------------------------------------------------------------------------
 # Main Application
 # -----------------------------------------------------------------------------
 def main():
-    st.title("🦌 MOOSE Exodus Output Viewer")
+    """Main application entry point."""
+    st.markdown('<div class="main-header">🦌 MOOSE Exodus Output Viewer</div>', unsafe_allow_html=True)
     st.markdown("""
-    **Upload** a MOOSE simulation output file (`.exodus`, `.e`, `.exo`) to visualize results interactively.
-    Files from the `dataset` folder are automatically detected; split files (`.e.part1`, `.e.part2`, …) are combined on the fly.
-    **Download** in ParaView‑compatible formats (.vtu, .vtp, .vtk, .stl).
+    **Visualize** MOOSE simulation results interactively in your browser.
+    **Download** in ParaView-compatible formats for advanced post-processing.
+    **Supports**: Single `.e` files OR split `.e.part1`, `.e.part2`, ... files (auto-combined).
     """)
-
+    
     app_dir = os.path.dirname(os.path.abspath(__file__))
     dataset_dir = os.path.join(app_dir, "dataset")
-
-    # Session state
-    if 'selected_group' not in st.session_state:
-        st.session_state.selected_group = None
-    if 'combined_file_path' not in st.session_state:
-        st.session_state.combined_file_path = None
+    
+    # Session state initialization
+    if 'selected_file_info' not in st.session_state:
+        st.session_state.selected_file_info = None
     if 'meshio_mesh' not in st.session_state:
         st.session_state.meshio_mesh = None
+    if 'mesh_stats' not in st.session_state:
+        st.session_state.mesh_stats = None
     if 'cache_dir' not in st.session_state:
         st.session_state.cache_dir = tempfile.mkdtemp(prefix="moose_viewer_")
-    if 'last_error' not in st.session_state:
-        st.session_state.last_error = None
-
-    # Clean up previous combined file
-    if st.session_state.combined_file_path and os.path.exists(st.session_state.combined_file_path):
-        try:
-            os.remove(st.session_state.combined_file_path)
-        except:
-            pass
+    if 'points' not in st.session_state:
+        st.session_state.points = None
+    if 'faces' not in st.session_state:
+        st.session_state.faces = None
+    if 'face_cell_map' not in st.session_state:
+        st.session_state.face_cell_map = None
+    if 'combined_file_path' not in st.session_state:
         st.session_state.combined_file_path = None
-
-    # Sidebar
+    if 'available_timesteps' not in st.session_state:
+        st.session_state.available_timesteps = None
+    if 'selected_timestep' not in st.session_state:
+        st.session_state.selected_timestep = None
+    
+    # Clear cache button
+    if st.sidebar.button("🗑️ Clear Cache", help="Clear loaded mesh and combined files"):
+        for key in ['meshio_mesh', 'mesh_stats', 'points', 'faces', 'face_cell_map', 
+                    'combined_file_path', 'available_timesteps', 'selected_timestep']:
+            st.session_state[key] = None
+        # Clean up temp combined files
+        if st.session_state.combined_file_path and os.path.exists(st.session_state.combined_file_path):
+            try:
+                os.remove(st.session_state.combined_file_path)
+            except:
+                pass
+        st.session_state.combined_file_path = None
+        st.rerun()
+    
     with st.sidebar:
-        st.header("1. Select File Source")
-        exodus_groups = find_exodus_files_grouped(dataset_dir)
-
+        st.header("1. Select File")
+        exodus_entries = find_exodus_files(dataset_dir)
+        
         source_option = st.radio(
-            "Choose file source:",
+            "File Source",
             ["Dataset Folder", "Upload File"],
             key="source_radio",
             horizontal=False
         )
-
-        selected_group = None
+        
+        selected_file_info = None
+        
         if source_option == "Dataset Folder":
-            st.subheader("Dataset Files")
-            if exodus_groups:
-                st.success(f"✅ Found {len(exodus_groups)} Exodus file(s)/group(s) in `dataset/`")
-                display_names = [g['display_name'] for g in exodus_groups]
+            if exodus_entries:
+                st.success(f"Found {len(exodus_entries)} file(s)/group(s)")
+                
+                file_options = {entry['display_name']: entry for entry in exodus_entries}
                 selected_display = st.selectbox(
-                    "Select Exodus File / Split Group",
-                    display_names,
+                    "Choose Exodus File",
+                    list(file_options.keys()),
                     key="file_select",
                     index=0
                 )
-                selected_group = next(g for g in exodus_groups if g['display_name'] == selected_display)
-
-                if selected_group['part_files']:
-                    st.info(f"📁 **Split group:** {selected_group['base_name']}\n"
-                            f"📊 **Total size:** {selected_group['total_size_mb']:.2f} MB\n"
-                            f"🧩 **Parts:** {len(selected_group['part_files'])}")
+                selected_file_info = file_options[selected_display]
+                
+                # Display file info
+                if selected_file_info['is_part_group']:
+                    st.markdown(f"""
+                    <div class="warning-box">
+                    <strong>🧩 Split file group:</strong><br>
+                    Base: <code>{os.path.basename(selected_file_info['path'])}</code><br>
+                    Parts: {len(selected_file_info['part_files'])}<br>
+                    Total size: {format_file_size(selected_file_info['total_size_mb'])}
+                    </div>
+                    """, unsafe_allow_html=True)
                 else:
-                    st.info(f"📁 **File:** {selected_group['single_file']}\n"
-                            f"📊 **Size:** {selected_group['total_size_mb']:.2f} MB")
+                    size_mb = get_file_size_mb(selected_file_info['path'])
+                    st.markdown(f"""
+                    <div class="success-box">
+                    <strong>{os.path.basename(selected_file_info['path'])}</strong><br>
+                    Size: {format_file_size(size_mb)}<br>
+                    <small>{selected_file_info['path']}</small>
+                    </div>
+                    """, unsafe_allow_html=True)
             else:
-                st.warning(f"⚠️ No Exodus files found in `dataset/` folder.")
-                st.markdown(f"**Expected path:** `{dataset_dir}`")
+                st.warning("No Exodus files in `dataset/`")
+                st.markdown(f"""
+                **Create folder:** `{dataset_dir}`<br>
+                **Supported:** `.e`, `.exo`, `.exodus`, `.out`, `.ex2`<br>
+                **Split files:** `.e.part1`, `.e.part2`, ... (auto-detected & combined)
+                """)
         else:
-            st.subheader("Upload File")
             uploaded_file = st.file_uploader(
-                "Choose an Exodus file",
-                type=['e', 'exodus', 'exo', 'out', 'ex2'],
+                "Upload Exodus File",
+                type=['e', 'exo', 'exodus', 'out', 'ex2'],
                 key="file_uploader",
-                accept_multiple_files=False
+                accept_multiple_files=True  # Allow uploading multiple .part files
             )
-            if uploaded_file is not None:
-                tmp_filename = f"uploaded_{uploaded_file.name}"
-                tmp_path = os.path.join(st.session_state.cache_dir, tmp_filename)
-                try:
+            
+            if uploaded_file:
+                if isinstance(uploaded_file, list) and len(uploaded_file) > 1:
+                    # Multiple files uploaded - check if they're parts
+                    part_files = [f for f in uploaded_file if is_part_file(f.name)]
+                    if part_files and len(part_files) == len(uploaded_file):
+                        # All are part files - combine them
+                        st.info(f"🧩 Detected {len(part_files)} part files - combining...")
+                        combined_name = f"combined_{os.path.splitext(part_files[0].name)[0]}.e"
+                        combined_path = os.path.join(st.session_state.cache_dir, combined_name)
+                        
+                        # Save parts to temp files and combine
+                        temp_parts = []
+                        for pf in sorted(part_files, key=lambda x: extract_part_number(x.name)):
+                            temp_path = os.path.join(st.session_state.cache_dir, pf.name)
+                            with open(temp_path, 'wb') as f:
+                                f.write(pf.getvalue())
+                            temp_parts.append(temp_path)
+                        
+                        if combine_part_files_binary(temp_parts, combined_path):
+                            selected_file_info = {
+                                'path': combined_path,
+                                'display_name': f"📦 Combined: {combined_name}",
+                                'is_part_group': True,
+                                'part_files': temp_parts,
+                                'total_size_mb': sum(len(pf.getvalue()) for pf in part_files) / (1024*1024)
+                            }
+                            st.session_state.combined_file_path = combined_path
+                            st.success("✅ Parts combined successfully")
+                        else:
+                            st.error("❌ Failed to combine part files")
+                    else:
+                        # Not all parts or mixed files - use first file
+                        first_file = uploaded_file[0]
+                        tmp_path = os.path.join(st.session_state.cache_dir, first_file.name)
+                        with open(tmp_path, 'wb') as f:
+                            f.write(first_file.getvalue())
+                        selected_file_info = {
+                            'path': tmp_path,
+                            'display_name': f"📄 {first_file.name}",
+                            'is_part_group': False,
+                            'part_files': None
+                        }
+                else:
+                    # Single file upload
+                    file = uploaded_file if not isinstance(uploaded_file, list) else uploaded_file[0]
+                    tmp_path = os.path.join(st.session_state.cache_dir, file.name)
                     with open(tmp_path, 'wb') as f:
-                        f.write(uploaded_file.getvalue())
-                    selected_group = {
-                        'display_name': uploaded_file.name,
-                        'base_name': uploaded_file.name,
-                        'directory': st.session_state.cache_dir,
-                        'part_files': [],
-                        'single_file': tmp_path,
-                        'total_size_mb': len(uploaded_file.getvalue()) / (1024 * 1024)
+                        f.write(file.getvalue())
+                    selected_file_info = {
+                        'path': tmp_path,
+                        'display_name': f"📄 {file.name}",
+                        'is_part_group': False,
+                        'part_files': None
                     }
-                    st.info(f"📊 **Uploaded:** {uploaded_file.name}\n\n📦 **Size:** {selected_group['total_size_mb']:.2f} MB")
-                except Exception as e:
-                    st.error(f"Error saving uploaded file: {e}")
-
+                
+                if selected_file_info:
+                    size_mb = selected_file_info.get('total_size_mb') or get_file_size_mb(selected_file_info['path'])
+                    st.markdown(f"""
+                    <div class="success-box">
+                    <strong>{os.path.basename(selected_file_info['path'])}</strong><br>
+                    Size: {format_file_size(size_mb)}
+                    </div>
+                    """, unsafe_allow_html=True)
+        
         st.divider()
         st.header("2. Visualization Settings")
-        color_map = st.selectbox("Color Map", ["Viridis","Plasma","Inferno","Magma","Cividis",
-                                                "Jet","Rainbow","Portland","Blackbody","Earth",
-                                                "Ice","Turbo","Spectral"], index=0)
-        opacity = st.slider("Opacity", 0.1, 1.0, 0.9, 0.05)
-        show_edges = st.checkbox("Show Mesh Edges", value=False)
-        show_scalar_bar = st.checkbox("Show Color Bar", value=True)
-
+        color_map = st.selectbox(
+            "Color Scale",
+            ["Viridis", "Plasma", "Inferno", "Magma", "Cividis",
+             "Jet", "Rainbow", "Portland", "Turbo", "Spectral"],
+            key="colormap"
+        )
+        opacity = st.slider("Opacity", 0.1, 1.0, 0.9, 0.05, key="opacity")
+        show_edges = st.checkbox("Show Edges", value=False, key="show_edges")
+        show_scalar_bar = st.checkbox("Show Color Bar", value=True, key="show_scalar_bar")
+        camera_preset = st.selectbox(
+            "Camera View",
+            ["isometric", "top", "front", "side", "corner"],
+            key="camera_preset"
+        )
+        
         st.divider()
-        st.header("ℹ️ About")
+        st.header("Info")
         st.markdown("""
-        **MOOSE Exodus Viewer**  
-        - Built with Streamlit + Plotly + Meshio  
-        - ParaView‑compatible exports  
-        - Automatic split‑file reassembly  
+        **MOOSE Exodus Viewer v3.0**<br>
+        Streamlit + Plotly + Meshio<br>
+        ParaView-compatible exports<br>
+        Auto-combines `.e.partN` split files<br>
+        **Exports:** VTU, VTK, STL, PLY, XDMF, CSV
         """)
-
-    # Main content
-    if selected_group is not None:
-        # Determine actual file path to load
-        if selected_group['part_files']:
-            combined_name = f"combined_{selected_group['base_name']}_{os.urandom(4).hex()}.e"
+    
+    # Main content area
+    if selected_file_info:
+        # Determine load path and handle part file combination
+        load_path = None
+        
+        if selected_file_info['is_part_group'] and selected_file_info['part_files']:
+            # Need to combine part files
+            combined_name = f"combined_{os.path.basename(selected_file_info['path'])}_{os.urandom(4).hex()}.e"
             combined_path = os.path.join(st.session_state.cache_dir, combined_name)
-            if combine_parts(selected_group['part_files'], combined_path):
+            
+            # Check if already combined in this session
+            if st.session_state.combined_file_path and os.path.exists(st.session_state.combined_file_path):
+                load_path = st.session_state.combined_file_path
+            elif combine_part_files_binary(selected_file_info['part_files'], combined_path):
                 load_path = combined_path
                 st.session_state.combined_file_path = combined_path
+                st.success(f"✅ Combined {len(selected_file_info['part_files'])} part files")
             else:
-                st.error("Failed to combine split files. Cannot load mesh.")
-                load_path = None
+                st.error("❌ Failed to combine part files. Cannot load mesh.")
         else:
-            load_path = selected_group['single_file']
+            load_path = selected_file_info['path']
             st.session_state.combined_file_path = None
-
-        # Reload mesh if needed
-        if load_path and (st.session_state.selected_group != selected_group or st.session_state.meshio_mesh is None):
-            st.session_state.selected_group = selected_group
+        
+        # Load mesh if needed
+        if load_path and (
+            st.session_state.selected_file_info != selected_file_info or 
+            st.session_state.meshio_mesh is None
+        ):
+            st.session_state.selected_file_info = selected_file_info
             st.session_state.meshio_mesh = None
-            st.session_state.last_error = None
-
-            meshio_mesh = load_exodus_data(load_path)
-            if meshio_mesh is not None:
+            st.session_state.mesh_stats = None
+            st.session_state.points = None
+            st.session_state.faces = None
+            st.session_state.face_cell_map = None
+            
+            # Get available timesteps BEFORE loading specific timestep
+            timesteps = get_exodus_timesteps(load_path)
+            st.session_state.available_timesteps = timesteps
+            
+            # Load mesh (with timestep if selected)
+            meshio_mesh = load_exodus_data(load_path, time_step=st.session_state.selected_timestep)
+            
+            if meshio_mesh:
                 st.session_state.meshio_mesh = meshio_mesh
+                st.session_state.mesh_stats = analyze_mesh(meshio_mesh)
+                st.session_state.points, st.session_state.faces, st.session_state.face_cell_map = extract_mesh_surfaces(meshio_mesh)
                 st.rerun()
-            else:
-                st.session_state.last_error = "Failed to load mesh"
         else:
             meshio_mesh = st.session_state.meshio_mesh
-
+        
         # Display mesh if loaded
-        if meshio_mesh is not None:
-            points, faces, face_centers = extract_mesh_surfaces(meshio_mesh)
-            point_vars, cell_vars, all_vars = get_available_variables(meshio_mesh)
-
-            col1, col2, col3 = st.columns([3,1,1])
+        if meshio_mesh:
+            stats = st.session_state.mesh_stats or analyze_mesh(meshio_mesh)
+            points = st.session_state.points
+            faces = st.session_state.faces
+            face_cell_map = st.session_state.face_cell_map
+            
+            # Display timestep selector if available
+            timesteps = st.session_state.available_timesteps
+            if timesteps and len(timesteps) > 1:
+                st.info(f"📊 File contains **{len(timesteps)} timesteps**")
+                
+                ts_labels = [ts['label'] for ts in timesteps]
+                current_idx = st.session_state.selected_timestep if st.session_state.selected_timestep is not None else len(timesteps) - 1
+                
+                selected_ts_label = st.selectbox(
+                    "🕐 Select Timestep",
+                    ts_labels,
+                    key="timestep_select",
+                    index=min(current_idx, len(ts_labels) - 1)
+                )
+                
+                selected_ts_idx = ts_labels.index(selected_ts_label)
+                selected_ts_data = timesteps[selected_ts_idx]
+                
+                # Reload if timestep changed
+                if st.session_state.selected_timestep != selected_ts_data['index']:
+                    st.session_state.selected_timestep = selected_ts_data['index']
+                    with st.spinner(f"Loading timestep {selected_ts_data['index']}..."):
+                        meshio_mesh = load_exodus_data(load_path, time_step=selected_ts_data['index'])
+                        if meshio_mesh:
+                            st.session_state.meshio_mesh = meshio_mesh
+                            st.session_state.points, st.session_state.faces, st.session_state.face_cell_map = extract_mesh_surfaces(meshio_mesh)
+                            st.success(f"✅ Loaded timestep: {selected_ts_data['label']}")
+                            st.rerun()
+                
+                # Show current timestep info
+                st.caption(f"Currently viewing: **{timesteps[st.session_state.selected_timestep]['label']}**" 
+                          if st.session_state.selected_timestep is not None else "")
+            
+            # Metrics display
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
+                st.markdown(f"""
+                <div class="metric-card">
+                <div class="metric-value">{stats.get('n_points', 0):,}</div>
+                <div class="metric-label">Points</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col2:
+                st.markdown(f"""
+                <div class="metric-card">
+                <div class="metric-value">{stats.get('n_cells', 0):,}</div>
+                <div class="metric-label">Cells</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col3:
+                cell_types = stats.get('cell_types', {})
+                st.markdown(f"""
+                <div class="metric-card">
+                <div class="metric-value">{len(cell_types)}</div>
+                <div class="metric-label">Cell Types</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col4:
+                all_vars = stats.get('point_vars', []) + stats.get('cell_vars', [])
+                st.markdown(f"""
+                <div class="metric-card">
+                <div class="metric-value">{len(all_vars)}</div>
+                <div class="metric-label">Variables</div>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Variable selection
+            point_vars, cell_vars, all_vars = get_available_variables(meshio_mesh)
+            col_var1, col_var2 = st.columns([3, 1])
+            with col_var1:
                 if not all_vars:
-                    st.info("ℹ️ No data variables found. Visualizing geometry only.")
+                    st.info("No variables found. Visualizing geometry only.")
                     variable_name = None
                 else:
-                    variable_name = st.selectbox("📊 Select Variable to Plot", all_vars, index=0)
-            with col2:
-                st.metric("🔵 Points", f"{len(meshio_mesh.points):,}" if meshio_mesh.points is not None else "0")
-            with col3:
-                n_cells = sum(len(c.data) for c in meshio_mesh.cells if c.data is not None) if meshio_mesh.cells else 0
-                st.metric("🔷 Cells", f"{n_cells:,}")
-
+                    variable_name = st.selectbox(
+                        "Select Variable",
+                        all_vars,
+                        key="var_select",
+                        index=0,
+                        help="Choose a field to visualize"
+                    )
+            with col_var2:
+                if variable_name and variable_name in stats.get('field_info', {}):
+                    info = stats['field_info'][variable_name]
+                    range_val = info.get('range')
+                    if range_val:
+                        st.metric("Range", f"{range_val[0]:.3g} to {range_val[1]:.3g}")
+            
+            # Get values for visualization
             values = None
             if variable_name and faces is not None and len(faces) > 0:
-                values = get_variable_values(meshio_mesh, variable_name, faces)
-
+                values = get_variable_values(meshio_mesh, variable_name, faces, face_cell_map)
+            
+            # Create visualization
             if points is not None and faces is not None and len(points) > 0 and len(faces) > 0:
                 fig = create_plotly_mesh(
                     points, faces, values,
                     color_map=color_map,
                     opacity=opacity,
                     show_edges=show_edges,
-                    title=variable_name if variable_name else "Mesh Geometry",
-                    show_scalar_bar=show_scalar_bar
+                    title=f"{variable_name or 'Mesh Geometry'}",
+                    show_scalar_bar=show_scalar_bar,
+                    camera_preset=camera_preset
                 )
                 st.divider()
-                st.subheader("🎨 3D Visualization")
-                st.plotly_chart(fig, use_container_width=True)
+                st.subheader("3D Visualization")
+                st.plotly_chart(fig, use_container_width=True, key="plotly_viz")
+                
+                if values is not None and len(values) > 0:
+                    with st.expander("Variable Distribution", expanded=False):
+                        hist_fig = create_variable_histogram(values, variable_name)
+                        if hist_fig:
+                            st.plotly_chart(hist_fig, use_container_width=True)
             else:
-                st.warning("⚠️ Could not extract mesh surfaces for visualization.")
-
-            # Download section
-            st.divider()
-            st.subheader("📥 Download for ParaView")
-            col_d1, col_d2, col_d3, col_d4 = st.columns(4)
-
-            with col_d1:
-                vtu_filename = "mesh_output.vtu"
-                vtu_path = os.path.join(st.session_state.cache_dir, vtu_filename)
-                vtu_success = convert_to_vtu(meshio_mesh, vtu_path)
-                if vtu_success and os.path.exists(vtu_path):
-                    with open(vtu_path, 'rb') as f:
-                        file_bytes = f.read()
-                    st.download_button(
-                        label="📥 Download .VTU",
-                        data=file_bytes,
-                        file_name=vtu_filename,
-                        mime="application/xml",
-                        key="download_vtu",
-                        help="Unstructured Grid format (recommended for ParaView)"
-                    )
-                else:
-                    st.button("❌ VTU Unavailable", disabled=True, key="download_vtu_disabled",
-                              help="Requires h5py: pip install h5py")
-
-            with col_d2:
-                vtp_filename = "mesh_surface.vtp"
-                vtp_path = os.path.join(st.session_state.cache_dir, vtp_filename)
-                vtp_success = convert_to_vtp(meshio_mesh, vtp_path)
-                if vtp_success and os.path.exists(vtp_path):
-                    with open(vtp_path, 'rb') as f:
-                        file_bytes = f.read()
-                    st.download_button(
-                        label="📥 Download .VTP",
-                        data=file_bytes,
-                        file_name=vtp_filename,
-                        mime="application/xml",
-                        key="download_vtp",
-                        help="PolyData format (surface mesh only)"
-                    )
-                else:
-                    st.button("❌ VTP Unavailable", disabled=True, key="download_vtp_disabled")
-
-            with col_d3:
-                vtk_filename = "mesh_output.vtk"
-                vtk_path = os.path.join(st.session_state.cache_dir, vtk_filename)
-                vtk_success = convert_to_vtk(meshio_mesh, vtk_path)
-                if vtk_success and os.path.exists(vtk_path):
-                    with open(vtk_path, 'rb') as f:
-                        file_bytes = f.read()
-                    st.download_button(
-                        label="📥 Download .VTK",
-                        data=file_bytes,
-                        file_name=vtk_filename,
-                        mime="text/plain",
-                        key="download_vtk",
-                        help="Legacy VTK format (widely compatible)"
-                    )
-                else:
-                    st.button("❌ VTK Unavailable", disabled=True, key="download_vtk_disabled")
-
-            with col_d4:
-                stl_filename = "mesh_surface.stl"
-                stl_path = os.path.join(st.session_state.cache_dir, stl_filename)
-                stl_success = convert_to_stl(meshio_mesh, stl_path)
-                if stl_success and os.path.exists(stl_path):
-                    with open(stl_path, 'rb') as f:
-                        file_bytes = f.read()
-                    st.download_button(
-                        label="📥 Download .STL",
-                        data=file_bytes,
-                        file_name=stl_filename,
-                        mime="application/sla",
-                        key="download_stl",
-                        help="STL format (for CAD/3D printing)"
-                    )
-                else:
-                    st.button("❌ STL Unavailable", disabled=True, key="download_stl_disabled")
-
-            col_xdmf1, col_xdmf2 = st.columns([1, 3])
-            with col_xdmf1:
-                xdmf_filename = "mesh_output.xdmf"
-                xdmf_path = os.path.join(st.session_state.cache_dir, xdmf_filename)
-                xdmf_success = convert_to_xdmf(meshio_mesh, xdmf_path)
-                if xdmf_success and os.path.exists(xdmf_path):
-                    with open(xdmf_path, 'rb') as f:
-                        file_bytes = f.read()
-                    st.download_button(
-                        label="📥 Download .XDMF",
-                        data=file_bytes,
-                        file_name=xdmf_filename,
-                        mime="application/xml",
-                        key="download_xdmf",
-                        help="XDMF format (requires h5py, for large datasets)"
-                    )
-                else:
-                    st.button("❌ XDMF Unavailable", disabled=True, key="download_xdmf_disabled",
-                              help="Requires h5py: pip install h5py")
-
-            with col_xdmf2:
-                st.info("""
-                **💡 ParaView Instructions:**
-                1. Download any format above (.vtu recommended for full mesh)
-                2. Open ParaView → File → Open → Select downloaded file
-                3. Click "Apply" in Properties panel
-                4. Use "Color By" dropdown to select variables
-                5. Use "Rescale to Data Range" for proper color mapping
+                st.warning("Could not extract mesh surfaces")
+                st.markdown("""
+                **Try:** Download and open in ParaView for full mesh support.
                 """)
+            
+            # Export section
+            st.divider()
+            st.subheader("Export for ParaView")
+            with st.expander("Mesh Details", expanded=False):
+                st.write(f"**File:** `{os.path.basename(load_path)}`")
+                if selected_file_info['is_part_group']:
+                    st.write(f"**Source:** Combined from {len(selected_file_info['part_files'])} part files")
+                st.write(f"**Points:** {stats.get('n_points', 0):,}")
+                st.write(f"**Cells:** {stats.get('n_cells', 0):,}")
+                if stats.get('cell_types'):
+                    st.write("**Cell Types:**")
+                    for ctype, count in stats['cell_types'].items():
+                        st.write(f"  - `{ctype}`: {count:,}")
+                if timesteps:
+                    st.write(f"**Timesteps:** {len(timesteps)}")
+                    if st.session_state.selected_timestep is not None:
+                        st.write(f"**Current:** {timesteps[st.session_state.selected_timestep]['label']}")
+                if stats.get('point_vars'):
+                    st.write("**Point Variables:**")
+                    for var in stats['point_vars']:
+                        info = stats.get('field_info', {}).get(var, {})
+                        st.write(f"  - `{var}` {info.get('shape', '')} {info.get('dtype', '')}")
+                if stats.get('cell_vars'):
+                    st.write("**Cell Variables:**")
+                    for var in stats['cell_vars']:
+                        info = stats.get('field_info', {}).get(var, {})
+                        st.write(f"  - `{var}` {info.get('shape', '')} {info.get('dtype', '')}")
+            
+            st.markdown("### Available Formats")
+            available_formats = {k: v for k, v in SUPPORTED_EXPORT_FORMATS.items()
+                               if k in get_meshio_write_formats()}
+            
+            if not available_formats:
+                st.warning("No export formats available. Check meshio installation.")
+            else:
+                cols = st.columns(min(len(available_formats), 6))
+                for idx, (fmt_key, fmt_info) in enumerate(available_formats.items()):
+                    with cols[idx % len(cols)]:
+                        export_filename = f"mesh_output{fmt_info['ext']}"
+                        export_path = os.path.join(st.session_state.cache_dir, export_filename)
+                        success, message, file_size = convert_mesh_format(
+                            meshio_mesh, export_path, fmt_key
+                        )
+                        if success and os.path.exists(export_path):
+                            with open(export_path, 'rb') as f:
+                                file_bytes = f.read()
+                            st.download_button(
+                                label=f"{fmt_info['name']}",
+                                data=file_bytes,
+                                file_name=export_filename,
+                                mime=fmt_info['mime'],
+                                key=f"download_{fmt_key}",
+                                help=f"{fmt_info['desc']}\nSize: {format_file_size(file_size)}",
+                                type="primary" if fmt_key == 'vtu' else "secondary"
+                            )
+                        else:
+                            st.button(
+                                label=f"Unavailable: {fmt_info['name']}",
+                                disabled=True,
+                                key=f"download_{fmt_key}_disabled",
+                                help=f"Unavailable: {message}"
+                            )
+                        st.caption(fmt_info['desc'].split('(')[0].strip())
+            
+            with st.expander("Format Comparison Guide", expanded=False):
+                st.markdown("""
+                | Format | Best For | ParaView | Variables | Size |
+                |--------|----------|----------|-----------|------|
+                | **VTU** | Full 3D analysis | Excellent | All | Medium |
+                | **VTK** | Legacy compatibility | Good | All | Large |
+                | **PLY** | Surface visualization | Limited | Point only | Small |
+                | **STL** | 3D printing/CAD | Geometry only | None | Small |
+                | **XDMF** | Large/parallel data | Excellent | All | Small |
+                | **Exodus** | MOOSE re-import | Native | All | Medium |
+                """)
+            
+            st.info("""
+            **Recommendation:**
+            - Use **VTU** for most ParaView workflows
+            - Use **PLY** for quick surface previews  
+            - Use **CSV** (below) for data analysis in Excel/Python
+            """)
+            
+            if variable_name:
+                st.markdown("### Export Variable Data (CSV)")
+                csv_filename = f"{variable_name}_data.csv"
+                csv_path = os.path.join(st.session_state.cache_dir, csv_filename)
+                csv_success, csv_msg = export_variable_csv(meshio_mesh, variable_name, csv_path)
+                if csv_success and os.path.exists(csv_path):
+                    with open(csv_path, 'rb') as f:
+                        csv_bytes = f.read()
+                    col_csv1, col_csv2 = st.columns([3, 1])
+                    with col_csv1:
+                        st.download_button(
+                            label=f"Download {csv_filename}",
+                            data=csv_bytes,
+                            file_name=csv_filename,
+                            mime="text/csv",
+                            key="download_csv",
+                            help="Variable values with point coordinates"
+                        )
+                    with col_csv2:
+                        try:
+                            row_count = pd.read_csv(csv_path).shape[0]
+                            st.metric("Rows", f"{row_count:,}")
+                        except Exception:
+                            st.metric("Rows", "Unknown")
+                else:
+                    st.button("CSV Export Unavailable", disabled=True, help=csv_msg)
+            
+            st.info("""
+            **ParaView Import Guide:**
+            1. Download `.vtu` file (recommended for full 3D mesh)
+            2. Open ParaView → File → Open → Select file
+            3. Click "Apply" in Properties panel
+            4. Use "Color By" to select variables
+            5. Click "Rescale to Data Range" for proper colors
+            """)
         else:
-            st.error("❌ Failed to load mesh data. Please check the file format and try again.")
-            if st.session_state.last_error:
-                st.code(st.session_state.last_error)
+            st.error("Failed to load mesh. Check file format and dependencies.")
     else:
-        st.info("👈 Please select or upload an Exodus file from the sidebar to begin.")
-
+        st.info("👈 Select or upload an Exodus file to begin")
+        with st.expander("Getting Started"):
+            st.markdown("""
+            ### Folder Structure
+            ```
+            project/
+            ├── app.py
+            ├── requirements.txt
+            └── dataset/
+                ├── simulation.e              # Single file
+                ├── simulation.e.part1        # Split file part 1
+                ├── simulation.e.part2        # Split file part 2
+                └── simulation.e.part3        # Split file part 3
+            ```
+            
+            ### MOOSE Input Example
+            ```python
+            [Outputs]
+            exodus = true
+            file_base = my_results
+            []
+            [Outputs/exodus]
+            output_on = 'timestep_end'
+            []
+            ```
+            
+            ### Installation
+            ```bash
+            # Minimal
+            pip install streamlit meshio plotly netCDF4
+            
+            # Full (with all exports)
+            pip install streamlit meshio plotly netCDF4 h5py pandas
+            ```
+            
+            ### Split File Notes
+            - Files split with `.part1`, `.part2`, ... are **auto-detected & combined**
+            - Ensure ALL parts are present and sequentially numbered
+            - Binary recombination restores original NetCDF structure
+            - Timestep metadata is preserved in the combined file
+            """)
+    
     st.divider()
     st.markdown("""
-    <div style='text-align: center; color: gray; padding: 20px;'>
-        <small>🦌 MOOSE Exodus Viewer v2.0 | Built with Streamlit + Plotly + Meshio | Split‑file support</small>
+    <div style="text-align: center; color: gray; padding: 1rem;">
+    <small>
+    MOOSE Exodus Viewer v3.0 |
+    Built with Streamlit + Plotly + Meshio |
+    <a href="https://mooseframework.inl.gov" target="_blank">MOOSE Framework</a>
+    </small>
     </div>
     """, unsafe_allow_html=True)
 
+# -----------------------------------------------------------------------------
+# Entry Point
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
