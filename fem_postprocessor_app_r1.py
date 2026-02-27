@@ -29,7 +29,7 @@ st.set_page_config(
     menu_items={
         'Get Help': 'https://mooseframework.inl.gov',
         'Report a bug': 'https://github.com/idaholab/moose/issues',
-        'About': "MOOSE Exodus Viewer v4.0\nBuilt with Streamlit + Plotly + Meshio\nWith Time Animation Support"
+        'About': "MOOSE Exodus Viewer v4.1\nWith enhanced timestep support"
     }
 )
 
@@ -222,7 +222,7 @@ def get_combined_file_size(part_files):
     return total_bytes / (1024 * 1024)
 
 # -----------------------------------------------------------------------------
-# Helper Functions - Timestep Discovery from Exodus Files (FIXED)
+# Helper Functions - Timestep Discovery from Exodus Files (Enhanced)
 # -----------------------------------------------------------------------------
 def get_exodus_timesteps(file_path):
     """
@@ -233,13 +233,15 @@ def get_exodus_timesteps(file_path):
         import netCDF4
         
         with netCDF4.Dataset(file_path, 'r') as ds:
+            # Try multiple common time variable names
             time_var = None
-            for var_name in ['time_values', 'time', 'global_time_values', 'time_step']:
+            for var_name in ['time_whole', 'time_values', 'global_time_values', 'time', 'times']:
                 if var_name in ds.variables:
                     time_var = ds.variables[var_name]
                     break
             
             if time_var is None:
+                # Fallback: use number of timesteps from attribute
                 if hasattr(ds, 'num_time_steps'):
                     n_steps = int(getattr(ds, 'num_time_steps'))
                     return [
@@ -264,33 +266,43 @@ def get_exodus_timesteps(file_path):
 def get_exodus_variable_at_timestep(file_path, variable_name, timestep_index):
     """
     Extract variable data at a specific timestep using netCDF4.
+    Handles 1D (time‑independent), 2D (time, entity) and 3D (time, entity, component) arrays.
     Returns numpy array or None.
     """
     try:
         import netCDF4
         
         with netCDF4.Dataset(file_path, 'r') as ds:
-            # Find the variable
             if variable_name not in ds.variables:
                 return None
             
             var = ds.variables[variable_name]
             
-            # Check dimensions - Exodus variables are typically (num_time_steps, num_nodes) or (num_time_steps, num_cells)
-            if var.ndim == 2:
-                # Time-dependent variable
+            # --- Handle different dimensionalities ---
+            if var.ndim == 1:
+                # Time‑independent (e.g., coordinates, ids)
+                return var[:]
+            
+            elif var.ndim == 2:
+                # Shape: (num_time, num_entities) – typical scalar field
                 if timestep_index < var.shape[0]:
                     return var[timestep_index, :]
                 else:
                     return None
-            elif var.ndim == 1:
-                # Time-independent variable (same for all timesteps)
-                return var[:]
+            
+            elif var.ndim == 3:
+                # Shape: (num_time, num_entities, num_components) – vector/tensor field
+                if timestep_index < var.shape[0]:
+                    return var[timestep_index, :, :]   # (num_entities, num_components)
+                else:
+                    return None
+            
             else:
+                st.warning(f"Variable '{variable_name}' has unsupported dimensionality {var.ndim}")
                 return None
                 
     except Exception as e:
-        st.warning(f"Could not read variable {variable_name} at timestep {timestep_index}: {e}")
+        st.warning(f"Could not read variable '{variable_name}' at timestep {timestep_index}: {e}")
         return None
 
 def load_exodus_mesh_structure(file_path):
@@ -305,7 +317,6 @@ def load_exodus_mesh_structure(file_path):
     
     try:
         with st.spinner(f"Reading mesh structure from {os.path.basename(file_path)}..."):
-            # Load mesh WITHOUT time_step parameter (FIXED)
             mesh = meshio.read(file_path)
             
             if mesh.points is None or len(mesh.points) == 0:
@@ -316,8 +327,7 @@ def load_exodus_mesh_structure(file_path):
                 st.warning("Mesh has no cells. Cannot visualize topology.")
                 return mesh
             
-            # Remove time-dependent data to save memory (we'll load it per timestep)
-            # Keep only mesh structure
+            # Keep only mesh structure, discard variable data
             mesh_static = meshio.Mesh(
                 points=mesh.points,
                 cells=mesh.cells,
@@ -325,7 +335,6 @@ def load_exodus_mesh_structure(file_path):
                 cell_data={},
                 field_data=mesh.field_data if hasattr(mesh, 'field_data') else {}
             )
-            
             return mesh_static
             
     except ImportError as e:
@@ -366,21 +375,16 @@ def load_exodus_data_with_timestep_variable(file_path, mesh_structure, variable_
         return None
     
     try:
-        # Get variable data at this timestep
         var_data = get_exodus_variable_at_timestep(file_path, variable_name, timestep_index)
         
         if var_data is None:
-            # Variable not found or not available at this timestep
-            # Return mesh structure without this variable
             return mesh_structure
         
-        # Determine if this is point or cell data based on size
+        var_array = np.asarray(var_data)
         n_points = len(mesh_structure.points)
         n_cells = sum(len(c.data) for c in mesh_structure.cells if c.data is not None)
         
-        var_array = np.asarray(var_data)
-        
-        # Create new mesh with variable data
+        # Determine if point or cell data based on length
         if len(var_array) == n_points:
             # Point data
             mesh_with_var = meshio.Mesh(
@@ -392,15 +396,27 @@ def load_exodus_data_with_timestep_variable(file_path, mesh_structure, variable_
             )
         elif len(var_array) == n_cells:
             # Cell data
+            # meshio expects cell_data as a list of arrays, one per cell block
+            # We'll distribute the array evenly across blocks (simple approach)
+            cell_data_list = []
+            start = 0
+            for cell_block in mesh_structure.cells:
+                if cell_block.data is not None:
+                    block_len = len(cell_block.data)
+                    cell_data_list.append(var_array[start:start+block_len])
+                    start += block_len
+                else:
+                    cell_data_list.append(np.array([]))
             mesh_with_var = meshio.Mesh(
                 points=mesh_structure.points,
                 cells=mesh_structure.cells,
                 point_data={},
-                cell_data={variable_name: [var_array]},
+                cell_data={variable_name: cell_data_list},
                 field_data=mesh_structure.field_data if hasattr(mesh_structure, 'field_data') else {}
             )
         else:
-            # Size mismatch - return structure without variable
+            # Size mismatch – return structure without variable
+            st.warning(f"Variable '{variable_name}' size {len(var_array)} does not match points ({n_points}) or cells ({n_cells})")
             return mesh_structure
         
         return mesh_with_var
@@ -476,21 +492,15 @@ def format_file_size(size_mb):
     elif size_mb < 100:
         return f"{size_mb:.2f} MB"
     else:
-        return f"{size_mb:.1f} MB"
+        return f"{size_mb:.1f} GB"
 
 # -----------------------------------------------------------------------------
 # Helper Functions - Mesh Loading & Analysis
 # -----------------------------------------------------------------------------
 def load_exodus_data(file_path):
     """
-    Reads an Exodus file using meshio.
-    FIXED: Removed time_step parameter that was causing TypeError.
-    
-    Args:
-        file_path: Path to Exodus file
-    
-    Returns:
-        meshio mesh object or None on error
+    Reads an Exodus file using meshio (full load, including all timesteps).
+    Not used in the main flow, kept for compatibility.
     """
     if not os.path.exists(file_path):
         st.error(f"File not found: {file_path}")
@@ -498,7 +508,6 @@ def load_exodus_data(file_path):
     
     try:
         with st.spinner(f"Reading {os.path.basename(file_path)}..."):
-            # FIXED: No time_step parameter here
             mesh = meshio.read(file_path)
             
             if mesh.points is None or len(mesh.points) == 0:
@@ -1034,6 +1043,7 @@ def export_variable_csv(meshio_mesh, variable_name, output_path):
 def get_variable_values(meshio_mesh, variable_name, faces, face_cell_map=None):
     """
     Extract scalar values for a variable, mapped to faces.
+    Handles multi‑component data by taking the Euclidean norm.
     """
     if variable_name is None or faces is None or len(faces) == 0:
         return None
@@ -1046,6 +1056,7 @@ def get_variable_values(meshio_mesh, variable_name, faces, face_cell_map=None):
         if point_values is None:
             return None
         point_values = np.asarray(point_values)
+        # If multi‑component, compute magnitude
         if point_values.ndim > 1 and point_values.shape[1] > 1:
             point_values = np.linalg.norm(point_values, axis=1)
         try:
@@ -1065,6 +1076,7 @@ def get_variable_values(meshio_mesh, variable_name, faces, face_cell_map=None):
             cell_values = np.concatenate(arrays)
         else:
             cell_values = np.asarray(cell_values)
+        # If multi‑component, compute magnitude
         if cell_values.ndim > 1 and cell_values.shape[1] > 1:
             cell_values = np.linalg.norm(cell_values, axis=1)
         
@@ -1251,10 +1263,10 @@ def main():
         st.divider()
         st.header("Info")
         st.markdown("""
-        **MOOSE Exodus Viewer v4.0**<br>
+        **MOOSE Exodus Viewer v4.1**<br>
         Streamlit + Plotly + Meshio<br>
         ParaView-compatible exports<br>
-        **Time Animation Support**<br>
+        **Enhanced Timestep Support**<br>
         **Exports:** VTU, VTK, STL, PLY, XDMF, CSV
         """)
     
@@ -1302,7 +1314,7 @@ def main():
             else:
                 st.session_state.current_timestep_index = 0
             
-            # Load mesh structure (FIXED: No time_step parameter)
+            # Load mesh structure (no variable data)
             mesh_structure = load_exodus_mesh_structure(load_path)
             
             if mesh_structure:
@@ -1314,7 +1326,9 @@ def main():
                 try:
                     import netCDF4
                     with netCDF4.Dataset(load_path, 'r') as ds:
-                        vars_list = [v for v in ds.variables.keys() if v not in ['num_nodes', 'num_cells', 'time_values', 'time']]
+                        # Exclude auxiliary variables
+                        exclude = {'num_nodes', 'num_cells', 'time_values', 'time', 'time_whole', 'global_time_values', 'connect', 'coord', 'coordx', 'coordy', 'coordz', 'eb_prop1', 'eb_prop2', 'eb_prop3'}
+                        vars_list = [v for v in ds.variables.keys() if v not in exclude]
                         st.session_state.available_variables = sorted(vars_list)
                 except:
                     point_vars, cell_vars, all_vars = get_available_variables(mesh_structure)
@@ -1349,10 +1363,11 @@ def main():
             
             # Display timestep information and controls
             if timesteps and len(timesteps) > 1:
+                current_time = timesteps[st.session_state.current_timestep_index]['time_value']
                 st.markdown(f"""
                 <div class="time-display">
                 🕐 Timestep {st.session_state.current_timestep_index + 1} of {len(timesteps)} | 
-                {timesteps[st.session_state.current_timestep_index]['label']}
+                t = {current_time:.4g}
                 </div>
                 """, unsafe_allow_html=True)
                 
@@ -1383,7 +1398,7 @@ def main():
                 
                 with col_anim4:
                     animation_speed = st.slider(
-                        "Speed",
+                        "Speed (ms)",
                         min_value=100,
                         max_value=2000,
                         value=st.session_state.animation_speed,
@@ -1439,7 +1454,8 @@ def main():
                 
                 st.divider()
             elif timesteps and len(timesteps) == 1:
-                st.info(f"📊 Single timestep: {timesteps[0]['label']}")
+                current_time = timesteps[0]['time_value']
+                st.info(f"📊 Single timestep: t = {current_time:.4g}")
             
             # Metrics display
             col1, col2, col3, col4 = st.columns(4)
@@ -1498,7 +1514,12 @@ def main():
                         var_data = point_data.get(variable_name) or (cell_data.get(variable_name)[0] if cell_data.get(variable_name) else None)
                         if var_data is not None:
                             arr = np.asarray(var_data)
-                            st.metric("Range", f"{np.min(arr):.3g} to {np.max(arr):.3g}")
+                            # If multi‑component, show component range or magnitude?
+                            if arr.ndim > 1 and arr.shape[1] > 1:
+                                mag = np.linalg.norm(arr, axis=1)
+                                st.metric("Magnitude range", f"{np.min(mag):.3g} to {np.max(mag):.3g}")
+                            else:
+                                st.metric("Range", f"{np.min(arr):.3g} to {np.max(arr):.3g}")
             
             # Get values for visualization
             values = None
@@ -1544,7 +1565,7 @@ def main():
                         st.write(f"  - `{ctype}`: {count:,}")
                 if timesteps:
                     st.write(f"**Timesteps:** {len(timesteps)}")
-                    st.write(f"**Current:** {timesteps[st.session_state.current_timestep_index]['label']}")
+                    st.write(f"**Current:** t = {timesteps[st.session_state.current_timestep_index]['time_value']:.4g}")
                 if available_vars:
                     st.write("**Variables:**")
                     for var in available_vars[:10]:
@@ -1680,18 +1701,19 @@ def main():
             pip install streamlit meshio plotly netCDF4 h5py pandas
             ```
             
-            ### What Was Fixed
-            - **Removed `time_step` parameter** from `meshio.read()` (not supported)
-            - **Use netCDF4 directly** to read timestep-specific variable data
-            - **Load mesh structure once**, then load variable data per timestep
-            - **Time slider and animation** work without reloading entire mesh
+            ### Features
+            - **Split files** (`.e.partN`) automatically combined
+            - **Timestep slider** and animation
+            - **Vector variable** support (magnitude shown)
+            - **Actual simulation time** displayed
+            - **Memory‑efficient** – only loads one timestep at a time
             """)
     
     st.divider()
     st.markdown("""
     <div style="text-align: center; color: gray; padding: 1rem;">
     <small>
-    MOOSE Exodus Viewer v4.0 |
+    MOOSE Exodus Viewer v4.1 |
     Built with Streamlit + Plotly + Meshio |
     <a href="https://mooseframework.inl.gov" target="_blank">MOOSE Framework</a>
     </small>
