@@ -29,7 +29,7 @@ st.set_page_config(
     menu_items={
         'Get Help': 'https://mooseframework.inl.gov',
         'Report a bug': 'https://github.com/idaholab/moose/issues',
-        'About': "MOOSE Exodus Viewer v4.1\nWith enhanced timestep support"
+        'About': "MOOSE Exodus Viewer v4.2\nWith enhanced timestep support"
     }
 )
 
@@ -1213,7 +1213,7 @@ def main():
         st.divider()
         st.header("Info")
         st.markdown("""
-        **MOOSE Exodus Viewer v4.1**<br>
+        **MOOSE Exodus Viewer v4.2**<br>
         Streamlit + Plotly + Meshio<br>
         ParaView-compatible exports<br>
         **Enhanced Timestep Support**<br>
@@ -1357,15 +1357,13 @@ def main():
                     )
                     st.session_state.animation_speed = animation_speed
                 
-                # Time slider
-                timestep_labels = [ts['label'] for ts in timesteps]
+                # Time slider - FIXED: removed invalid format_func parameter
                 current_ts = st.slider(
                     "⏱️ Time Slider",
                     min_value=0,
                     max_value=len(timesteps) - 1,
                     value=st.session_state.current_timestep_index,
                     step=1,
-                    format_func=lambda x: timestep_labels[x],
                     key="time_slider"
                 )
                 
@@ -1661,7 +1659,7 @@ def main():
     st.markdown("""
     <div style="text-align: center; color: gray; padding: 1rem;">
     <small>
-    MOOSE Exodus Viewer v4.1 |
+    MOOSE Exodus Viewer v4.2 |
     Built with Streamlit + Plotly + Meshio |
     <a href="https://mooseframework.inl.gov" target="_blank">MOOSE Framework</a>
     </small>
