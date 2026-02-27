@@ -164,7 +164,7 @@ SUPPORTED_EXPORT_FORMATS = {
 }
 
 # -----------------------------------------------------------------------------
-# Helper Functions - Part File Discovery & Combination
+# Helper Functions - Part File Discovery & Grouping (merged from original)
 # -----------------------------------------------------------------------------
 def is_part_file(filename):
     """Check if filename matches .e.partN pattern."""
@@ -175,24 +175,87 @@ def extract_part_number(filename):
     match = re.search(r'\.part(\d+)$', filename, re.IGNORECASE)
     return int(match.group(1)) if match else None
 
-def find_part_files_for_base(base_path, max_parts=1000):
+def get_base_name_from_part(part_filename):
+    """Remove the .partN suffix to get the base filename."""
+    return re.sub(r'\.part\d+$', '', part_filename)
+
+def find_exodus_files_grouped(search_dir, recursive=True):
     """
-    Find all .e.partN files for a given base Exodus file.
-    Returns sorted list of part file paths, or empty list if none found.
+    Recursively find all Exodus files and split-file groups (including parts without base .e).
+    Returns list of groups, each a dict with 'display_name', 'base_name', 'directory', 'part_files', 'single_file', 'total_size_mb'.
     """
-    base = Path(base_path)
+    exodus_extensions = ['.e', '.exo', '.exodus', '.out', '.ex2', '.e-s001', '.e-s002']
+    regular_files = []
     part_files = []
     
-    for i in range(1, max_parts + 1):
-        part_file = base.parent / f"{base.name}.part{i}"
-        if part_file.exists():
-            part_files.append(str(part_file))
-        else:
-            if i > 1:
-                break
+    if not os.path.exists(search_dir):
+        return []
     
-    part_files.sort(key=lambda x: extract_part_number(os.path.basename(x)))
-    return part_files
+    try:
+        walk_func = os.walk if recursive else lambda x: [(x, [], os.listdir(x))]
+        for root, dirs, files in walk_func(search_dir):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', '.git']]
+            for file in files:
+                if file.startswith('.'):
+                    continue
+                full_path = os.path.join(root, file)
+                if is_part_file(file):
+                    part_files.append(full_path)
+                else:
+                    file_ext = os.path.splitext(file)[1].lower()
+                    if file_ext in exodus_extensions or re.match(r'\.e-s\d+$', file_ext):
+                        regular_files.append(full_path)
+    except PermissionError as e:
+        st.warning(f"Permission denied accessing: {search_dir}")
+    except Exception as e:
+        st.warning(f"Error scanning directory: {e}")
+    
+    # Group part files by (directory, base_name)
+    part_groups = {}
+    for pf in part_files:
+        dirname = os.path.dirname(pf)
+        base = get_base_name_from_part(os.path.basename(pf))
+        key = (dirname, base)
+        part_groups.setdefault(key, []).append(pf)
+    
+    # Sort part files numerically within each group
+    for key in part_groups:
+        part_groups[key].sort(key=lambda x: extract_part_number(os.path.basename(x)))
+    
+    # Build groups from part files (even without base .e)
+    groups = []
+    for (dirname, base), part_list in part_groups.items():
+        total_size = sum(os.path.getsize(p) for p in part_list) / (1024 * 1024)
+        display_path = os.path.join(dirname, base) if dirname != '.' else base
+        groups.append({
+            'display_name': f"{display_path} ({len(part_list)} parts, {total_size:.1f} MB)",
+            'base_name': base,
+            'directory': dirname,
+            'part_files': part_list,
+            'single_file': None,
+            'total_size_mb': total_size
+        })
+    
+    # Add regular files that are NOT already represented by a part group
+    bases_with_parts = {(dirname, base) for (dirname, base) in part_groups.keys()}
+    for rf in regular_files:
+        dirname = os.path.dirname(rf)
+        basename = os.path.basename(rf)
+        if (dirname, basename) not in bases_with_parts:
+            size_mb = os.path.getsize(rf) / (1024 * 1024)
+            display_path = os.path.join(dirname, basename) if dirname != '.' else basename
+            groups.append({
+                'display_name': f"{display_path} ({size_mb:.1f} MB)",
+                'base_name': basename,
+                'directory': dirname,
+                'part_files': [],
+                'single_file': rf,
+                'total_size_mb': size_mb
+            })
+    
+    # Sort groups alphabetically by display name
+    groups.sort(key=lambda g: g['display_name'].lower())
+    return groups
 
 def combine_part_files_binary(part_files, output_path):
     """
@@ -215,11 +278,6 @@ def combine_part_files_binary(part_files, output_path):
     except Exception as e:
         st.error(f"Failed to combine part files: {e}")
         return False
-
-def get_combined_file_size(part_files):
-    """Calculate total size of all part files in MB."""
-    total_bytes = sum(os.path.getsize(p) for p in part_files if os.path.exists(p))
-    return total_bytes / (1024 * 1024)
 
 # -----------------------------------------------------------------------------
 # Helper Functions - Timestep Discovery from Exodus Files (Enhanced)
@@ -395,9 +453,7 @@ def load_exodus_data_with_timestep_variable(file_path, mesh_structure, variable_
                 field_data=mesh_structure.field_data if hasattr(mesh_structure, 'field_data') else {}
             )
         elif len(var_array) == n_cells:
-            # Cell data
-            # meshio expects cell_data as a list of arrays, one per cell block
-            # We'll distribute the array evenly across blocks (simple approach)
+            # Cell data: distribute across cell blocks
             cell_data_list = []
             start = 0
             for cell_block in mesh_structure.cells:
@@ -426,57 +482,8 @@ def load_exodus_data_with_timestep_variable(file_path, mesh_structure, variable_
         return mesh_structure
 
 # -----------------------------------------------------------------------------
-# Helper Functions - File Discovery
+# Helper Functions - File Utilities
 # -----------------------------------------------------------------------------
-def find_exodus_files(search_dir, recursive=True):
-    """
-    Recursively find all Exodus files in the given directory.
-    """
-    exodus_extensions = ['.e', '.exo', '.exodus', '.out', '.ex2', '.e-s001', '.e-s002']
-    exodus_files = []
-    
-    if not os.path.exists(search_dir):
-        return exodus_files
-    
-    try:
-        if recursive:
-            for root, dirs, files in os.walk(search_dir):
-                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', '.git']]
-                for file in files:
-                    if file.startswith('.'):
-                        continue
-                    file_ext = os.path.splitext(file)[1].lower()
-                    if file_ext in exodus_extensions or re.match(r'\.e-s\d+$', file_ext):
-                        full_path = os.path.join(root, file)
-                        exodus_files.append(full_path)
-        else:
-            for file in os.listdir(search_dir):
-                if file.startswith('.'):
-                    continue
-                file_ext = os.path.splitext(file)[1].lower()
-                if file_ext in exodus_extensions:
-                    full_path = os.path.join(search_dir, file)
-                    exodus_files.append(full_path)
-    except PermissionError as e:
-        st.warning(f"Permission denied accessing: {search_dir}")
-    except Exception as e:
-        st.warning(f"Error scanning directory: {e}")
-    
-    exodus_files.sort(key=lambda x: (os.path.dirname(x), os.path.basename(x).lower()))
-    return exodus_files
-
-def get_file_display_name(file_path, base_dir):
-    """Creates a user-friendly display name showing relative path."""
-    try:
-        rel_path = os.path.relpath(file_path, base_dir)
-        if os.path.dirname(rel_path):
-            return f"📁 {rel_path}"
-        return f"📄 {os.path.basename(file_path)}"
-    except ValueError:
-        return f"📄 {os.path.basename(file_path)}"
-    except Exception:
-        return os.path.basename(file_path)
-
 def get_file_size_mb(file_path):
     """Get file size in MB with error handling."""
     try:
@@ -495,64 +502,10 @@ def format_file_size(size_mb):
         return f"{size_mb:.1f} GB"
 
 # -----------------------------------------------------------------------------
-# Helper Functions - Mesh Loading & Analysis
+# Helper Functions - Mesh Analysis and Visualization
 # -----------------------------------------------------------------------------
-def load_exodus_data(file_path):
-    """
-    Reads an Exodus file using meshio (full load, including all timesteps).
-    Not used in the main flow, kept for compatibility.
-    """
-    if not os.path.exists(file_path):
-        st.error(f"File not found: {file_path}")
-        return None
-    
-    try:
-        with st.spinner(f"Reading {os.path.basename(file_path)}..."):
-            mesh = meshio.read(file_path)
-            
-            if mesh.points is None or len(mesh.points) == 0:
-                st.warning("Mesh has no points. File may be empty or corrupted.")
-                return None
-            
-            if not mesh.cells or all(c.data is None or len(c.data) == 0 for c in mesh.cells):
-                st.warning("Mesh has no cells. Cannot visualize topology.")
-                return mesh
-            
-            return mesh
-            
-    except ImportError as e:
-        error_msg = str(e).lower()
-        if 'netcdf' in error_msg or 'netcdf4' in error_msg:
-            st.error("Missing NetCDF support for Exodus files")
-            st.info("Install with: `pip install netCDF4` or `conda install -c conda-forge netcdf4`")
-        elif 'h5py' in error_msg:
-            st.error("Missing h5py for HDF5-based Exodus files")
-            st.info("Install with: `pip install h5py`")
-        else:
-            st.error(f"Missing dependency: {e}")
-        return None
-    except Exception as e:
-        error_type = type(e).__name__
-        error_msg = str(e)
-        if 'NC_' in error_msg or 'NetCDF' in error_msg:
-            st.error(f"NetCDF error: {error_msg}")
-            st.info("Try: `pip install --upgrade netCDF4`")
-        elif 'HDF5' in error_msg or 'hdf5' in error_msg.lower():
-            st.error(f"HDF5 error: {error_msg}")
-            st.info("Try: `pip install h5py` or check file integrity")
-        elif 'format' in error_msg.lower() or 'magic' in error_msg.lower():
-            st.error(f"File format error: {error_msg}")
-            st.info("Ensure this is a valid MOOSE Exodus output file")
-        else:
-            st.error(f"Error reading file ({error_type}): {error_msg}")
-        with st.expander("Technical Details", expanded=False):
-            st.code(f"File: {file_path}\nError: {error_type}: {error_msg}", language="text")
-        return None
-
 def analyze_mesh(meshio_mesh):
-    """
-    Analyze mesh and return statistics dictionary.
-    """
+    """Analyze mesh and return statistics dictionary."""
     if meshio_mesh is None:
         return {}
     
@@ -629,9 +582,6 @@ def analyze_mesh(meshio_mesh):
     
     return stats
 
-# -----------------------------------------------------------------------------
-# Helper Functions - Surface Extraction for Plotly
-# -----------------------------------------------------------------------------
 def extract_mesh_surfaces(meshio_mesh, cell_types_filter=None):
     """
     Extract surface triangles from mesh for Plotly visualization.
@@ -663,13 +613,10 @@ def extract_mesh_surfaces(meshio_mesh, cell_types_filter=None):
             if cell_type in ['tetra', 'tetrahedron']:
                 for cell_idx, cell in enumerate(cells):
                     if len(cell) >= 4:
-                        tetra_faces = [
-                            [cell[0], cell[1], cell[2]],
-                            [cell[0], cell[1], cell[3]],
-                            [cell[0], cell[2], cell[3]],
-                            [cell[1], cell[2], cell[3]]
-                        ]
-                        for face in tetra_faces:
+                        for face in ([cell[0], cell[1], cell[2]],
+                                     [cell[0], cell[1], cell[3]],
+                                     [cell[0], cell[2], cell[3]],
+                                     [cell[1], cell[2], cell[3]]):
                             faces.append(face)
                             face_cell_map.append((block_idx, cell_idx))
             
@@ -757,15 +704,10 @@ def extract_mesh_surfaces(meshio_mesh, cell_types_filter=None):
     except Exception as e:
         return None, None, None
 
-# -----------------------------------------------------------------------------
-# Helper Functions - Plotly Visualization
-# -----------------------------------------------------------------------------
 def create_plotly_mesh(points, faces, values=None, color_map='Viridis',
                        opacity=0.9, show_edges=False, title="Mesh",
                        show_scalar_bar=True, camera_preset='isometric'):
-    """
-    Create a Plotly 3D mesh visualization with extensive customization.
-    """
+    """Create a Plotly 3D mesh visualization."""
     if points is None or faces is None or len(points) == 0 or len(faces) == 0:
         fig = go.Figure()
         fig.add_annotation(
@@ -911,12 +853,91 @@ def create_variable_histogram(values, var_name, nbins=50):
         return None
 
 # -----------------------------------------------------------------------------
+# Helper Functions - Data Processing
+# -----------------------------------------------------------------------------
+def get_variable_values(meshio_mesh, variable_name, faces, face_cell_map=None):
+    """
+    Extract scalar values for a variable, mapped to faces.
+    Handles multi‑component data by taking the Euclidean norm.
+    """
+    if variable_name is None or faces is None or len(faces) == 0:
+        return None
+    
+    point_data = getattr(meshio_mesh, 'point_data', None) or {}
+    cell_data = getattr(meshio_mesh, 'cell_data', None) or {}
+    
+    if variable_name in point_data:
+        point_values = point_data[variable_name]
+        if point_values is None:
+            return None
+        point_values = np.asarray(point_values)
+        # If multi‑component, compute magnitude
+        if point_values.ndim > 1 and point_values.shape[1] > 1:
+            point_values = np.linalg.norm(point_values, axis=1)
+        try:
+            face_values = np.mean(point_values[faces], axis=1)
+            return face_values
+        except (IndexError, TypeError, ValueError):
+            return None
+    
+    elif variable_name in cell_data:
+        cell_values = cell_data[variable_name]
+        if cell_values is None:
+            return None
+        if isinstance(cell_values, list):
+            arrays = [np.asarray(a) for a in cell_values if a is not None]
+            if not arrays:
+                return None
+            cell_values = np.concatenate(arrays)
+        else:
+            cell_values = np.asarray(cell_values)
+        # If multi‑component, compute magnitude
+        if cell_values.ndim > 1 and cell_values.shape[1] > 1:
+            cell_values = np.linalg.norm(cell_values, axis=1)
+        
+        if face_cell_map and len(face_cell_map) == len(faces):
+            face_values = np.zeros(len(faces))
+            for face_idx, (block_idx, cell_idx) in enumerate(face_cell_map):
+                global_idx = 0
+                for bi, cb in enumerate(meshio_mesh.cells):
+                    if cb and cb.data is not None:
+                        if bi < block_idx:
+                            global_idx += len(cb.data)
+                        elif bi == block_idx:
+                            global_idx += cell_idx
+                            break
+                if 0 <= global_idx < len(cell_values):
+                    face_values[face_idx] = cell_values[global_idx]
+            return face_values
+        
+        total_cells = sum(len(cb.data) for cb in meshio_mesh.cells if cb and cb.data is not None)
+        if total_cells > 0 and len(cell_values) == total_cells:
+            faces_per_cell = max(1, len(faces) // total_cells)
+            face_values = np.repeat(cell_values, faces_per_cell)
+            if len(face_values) > len(faces):
+                face_values = face_values[:len(faces)]
+            elif len(face_values) < len(faces):
+                face_values = np.pad(face_values, (0, len(faces) - len(face_values)), mode='edge')
+            return face_values
+        return None
+    
+    return None
+
+def get_available_variables(meshio_mesh):
+    """Get list of available variables with metadata."""
+    if meshio_mesh is None:
+        return [], [], []
+    point_data = getattr(meshio_mesh, 'point_data', None) or {}
+    cell_data = getattr(meshio_mesh, 'cell_data', None) or {}
+    point_vars = sorted([v for v in point_data.keys() if v and isinstance(v, str)])
+    cell_vars = sorted([v for v in cell_data.keys() if v and isinstance(v, str)])
+    return point_vars, cell_vars, point_vars + cell_vars
+
+# -----------------------------------------------------------------------------
 # Helper Functions - Format Conversion for ParaView
 # -----------------------------------------------------------------------------
 def get_meshio_write_formats():
-    """
-    Dynamically get supported write formats from meshio.
-    """
+    """Dynamically get supported write formats from meshio."""
     try:
         import meshio
         if hasattr(meshio, '_format_registry'):
@@ -929,9 +950,7 @@ def get_meshio_write_formats():
         return {'vtu', 'vtk', 'stl', 'ply', 'xdmf', 'exodus'}
 
 def convert_mesh_format(meshio_mesh, output_path, file_format):
-    """
-    Convert mesh to specified format using meshio.
-    """
+    """Convert mesh to specified format using meshio."""
     if meshio_mesh is None:
         return False, "No mesh data to export", 0
     
@@ -1038,91 +1057,9 @@ def export_variable_csv(meshio_mesh, variable_name, output_path):
         return False, f"{type(e).__name__}: {e}"
 
 # -----------------------------------------------------------------------------
-# Helper Functions - Data Processing
-# -----------------------------------------------------------------------------
-def get_variable_values(meshio_mesh, variable_name, faces, face_cell_map=None):
-    """
-    Extract scalar values for a variable, mapped to faces.
-    Handles multi‑component data by taking the Euclidean norm.
-    """
-    if variable_name is None or faces is None or len(faces) == 0:
-        return None
-    
-    point_data = getattr(meshio_mesh, 'point_data', None) or {}
-    cell_data = getattr(meshio_mesh, 'cell_data', None) or {}
-    
-    if variable_name in point_data:
-        point_values = point_data[variable_name]
-        if point_values is None:
-            return None
-        point_values = np.asarray(point_values)
-        # If multi‑component, compute magnitude
-        if point_values.ndim > 1 and point_values.shape[1] > 1:
-            point_values = np.linalg.norm(point_values, axis=1)
-        try:
-            face_values = np.mean(point_values[faces], axis=1)
-            return face_values
-        except (IndexError, TypeError, ValueError):
-            return None
-    
-    elif variable_name in cell_data:
-        cell_values = cell_data[variable_name]
-        if cell_values is None:
-            return None
-        if isinstance(cell_values, list):
-            arrays = [np.asarray(a) for a in cell_values if a is not None]
-            if not arrays:
-                return None
-            cell_values = np.concatenate(arrays)
-        else:
-            cell_values = np.asarray(cell_values)
-        # If multi‑component, compute magnitude
-        if cell_values.ndim > 1 and cell_values.shape[1] > 1:
-            cell_values = np.linalg.norm(cell_values, axis=1)
-        
-        if face_cell_map and len(face_cell_map) == len(faces):
-            face_values = np.zeros(len(faces))
-            for face_idx, (block_idx, cell_idx) in enumerate(face_cell_map):
-                global_idx = 0
-                for bi, cb in enumerate(meshio_mesh.cells):
-                    if cb and cb.data is not None:
-                        if bi < block_idx:
-                            global_idx += len(cb.data)
-                        elif bi == block_idx:
-                            global_idx += cell_idx
-                            break
-                if 0 <= global_idx < len(cell_values):
-                    face_values[face_idx] = cell_values[global_idx]
-            return face_values
-        
-        total_cells = sum(len(cb.data) for cb in meshio_mesh.cells if cb and cb.data is not None)
-        if total_cells > 0 and len(cell_values) == total_cells:
-            faces_per_cell = max(1, len(faces) // total_cells)
-            face_values = np.repeat(cell_values, faces_per_cell)
-            if len(face_values) > len(faces):
-                face_values = face_values[:len(faces)]
-            elif len(face_values) < len(faces):
-                face_values = np.pad(face_values, (0, len(faces) - len(face_values)), mode='edge')
-            return face_values
-        return None
-    
-    return None
-
-def get_available_variables(meshio_mesh):
-    """Get list of available variables with metadata."""
-    if meshio_mesh is None:
-        return [], [], []
-    point_data = getattr(meshio_mesh, 'point_data', None) or {}
-    cell_data = getattr(meshio_mesh, 'cell_data', None) or {}
-    point_vars = sorted([v for v in point_data.keys() if v and isinstance(v, str)])
-    cell_vars = sorted([v for v in cell_data.keys() if v and isinstance(v, str)])
-    return point_vars, cell_vars, point_vars + cell_vars
-
-# -----------------------------------------------------------------------------
 # Main Application
 # -----------------------------------------------------------------------------
 def main():
-    """Main application entry point."""
     st.markdown('<div class="main-header">🦌 MOOSE Exodus Output Viewer</div>', unsafe_allow_html=True)
     st.markdown("""
     **Visualize** MOOSE simulation results interactively in your browser.
@@ -1134,8 +1071,8 @@ def main():
     dataset_dir = os.path.join(app_dir, "dataset")
     
     # Session state initialization
-    if 'selected_file_path' not in st.session_state:
-        st.session_state.selected_file_path = None
+    if 'selected_group' not in st.session_state:
+        st.session_state.selected_group = None
     if 'mesh_structure' not in st.session_state:
         st.session_state.mesh_structure = None
     if 'meshio_mesh' not in st.session_state:
@@ -1167,9 +1104,9 @@ def main():
     
     # Clear cache button
     if st.sidebar.button("🗑️ Clear Cache", help="Clear loaded mesh data"):
-        for key in ['mesh_structure', 'meshio_mesh', 'mesh_stats', 'points', 'faces', 'face_cell_map', 
-                    'available_timesteps', 'current_timestep_index', 'combined_file_path', 
-                    'available_variables', 'selected_variable']:
+        for key in ['mesh_structure', 'meshio_mesh', 'mesh_stats', 'points', 'faces', 'face_cell_map',
+                    'available_timesteps', 'current_timestep_index', 'combined_file_path',
+                    'available_variables', 'selected_variable', 'selected_group']:
             st.session_state[key] = None
         st.session_state.is_playing = False
         if st.session_state.combined_file_path and os.path.exists(st.session_state.combined_file_path):
@@ -1182,7 +1119,7 @@ def main():
     
     with st.sidebar:
         st.header("1. Select File")
-        exodus_files = find_exodus_files(dataset_dir)
+        exodus_groups = find_exodus_files_grouped(dataset_dir)
         
         source_option = st.radio(
             "File Source",
@@ -1191,27 +1128,35 @@ def main():
             horizontal=False
         )
         
-        selected_file_path = None
+        selected_group = None
         
         if source_option == "Dataset Folder":
-            if exodus_files:
-                st.success(f"Found {len(exodus_files)} file(s)")
-                file_options = {get_file_display_name(f, app_dir): f for f in exodus_files}
+            if exodus_groups:
+                st.success(f"Found {len(exodus_groups)} file(s)/group(s)")
+                display_names = [g['display_name'] for g in exodus_groups]
                 selected_display = st.selectbox(
-                    "Choose Exodus File",
-                    list(file_options.keys()),
+                    "Choose Exodus File / Group",
+                    display_names,
                     key="file_select",
                     index=0
                 )
-                selected_file_path = file_options[selected_display]
-                size_mb = get_file_size_mb(selected_file_path)
-                st.markdown(f"""
-                <div class="success-box">
-                <strong>{os.path.basename(selected_file_path)}</strong><br>
-                Size: {format_file_size(size_mb)}<br>
-                <small>{selected_file_path}</small>
-                </div>
-                """, unsafe_allow_html=True)
+                selected_group = next(g for g in exodus_groups if g['display_name'] == selected_display)
+                if selected_group['part_files']:
+                    st.markdown(f"""
+                    <div class="success-box">
+                    <strong>{selected_group['base_name']}</strong><br>
+                    Parts: {len(selected_group['part_files'])}<br>
+                    Size: {format_file_size(selected_group['total_size_mb'])}
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div class="success-box">
+                    <strong>{selected_group['base_name']}</strong><br>
+                    Size: {format_file_size(selected_group['total_size_mb'])}<br>
+                    <small>{selected_group['single_file']}</small>
+                    </div>
+                    """, unsafe_allow_html=True)
             else:
                 st.warning("No Exodus files in `dataset/`")
                 st.markdown(f"""
@@ -1229,12 +1174,18 @@ def main():
                 tmp_path = os.path.join(st.session_state.cache_dir, uploaded_file.name)
                 with open(tmp_path, 'wb') as f:
                     f.write(uploaded_file.getvalue())
-                selected_file_path = tmp_path
-                size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+                selected_group = {
+                    'display_name': uploaded_file.name,
+                    'base_name': uploaded_file.name,
+                    'directory': st.session_state.cache_dir,
+                    'part_files': [],
+                    'single_file': tmp_path,
+                    'total_size_mb': len(uploaded_file.getvalue()) / (1024 * 1024)
+                }
                 st.markdown(f"""
                 <div class="success-box">
                 <strong>{uploaded_file.name}</strong><br>
-                Size: {format_file_size(size_mb)}
+                Size: {format_file_size(selected_group['total_size_mb'])}
                 </div>
                 """, unsafe_allow_html=True)
         
@@ -1257,7 +1208,6 @@ def main():
         
         st.divider()
         st.header("3. Time Animation")
-        
         st.caption("Time controls appear after file loads")
         
         st.divider()
@@ -1271,13 +1221,13 @@ def main():
         """)
     
     # Main content area
-    if selected_file_path:
-        # Check for part files and combine if needed
-        load_path = selected_file_path
-        part_files = find_part_files_for_base(selected_file_path)
+    if selected_group:
+        # Determine load_path (combine if parts)
+        load_path = selected_group['single_file']
+        part_files = selected_group['part_files']
         
         if part_files:
-            combined_name = f"combined_{os.path.basename(selected_file_path)}_{os.urandom(4).hex()}.e"
+            combined_name = f"combined_{selected_group['base_name']}_{os.urandom(4).hex()}.e"
             combined_path = os.path.join(st.session_state.cache_dir, combined_name)
             
             if st.session_state.combined_file_path and os.path.exists(st.session_state.combined_file_path):
@@ -1290,12 +1240,12 @@ def main():
                 st.error("❌ Failed to combine part files")
                 load_path = None
         
-        # Load mesh structure and timesteps if file changed
+        # Load mesh structure and timesteps if group changed
         if load_path and (
-            st.session_state.selected_file_path != load_path or 
+            st.session_state.selected_group != selected_group or
             st.session_state.mesh_structure is None
         ):
-            st.session_state.selected_file_path = load_path
+            st.session_state.selected_group = selected_group
             st.session_state.mesh_structure = None
             st.session_state.meshio_mesh = None
             st.session_state.mesh_stats = None
@@ -1326,7 +1276,6 @@ def main():
                 try:
                     import netCDF4
                     with netCDF4.Dataset(load_path, 'r') as ds:
-                        # Exclude auxiliary variables
                         exclude = {'num_nodes', 'num_cells', 'time_values', 'time', 'time_whole', 'global_time_values', 'connect', 'coord', 'coordx', 'coordy', 'coordz', 'eb_prop1', 'eb_prop2', 'eb_prop3'}
                         vars_list = [v for v in ds.variables.keys() if v not in exclude]
                         st.session_state.available_variables = sorted(vars_list)
@@ -1350,9 +1299,9 @@ def main():
             variable_name = st.session_state.selected_variable
             if variable_name and timesteps:
                 mesh_with_var = load_exodus_data_with_timestep_variable(
-                    load_path, 
-                    mesh_structure, 
-                    variable_name, 
+                    load_path,
+                    mesh_structure,
+                    variable_name,
                     st.session_state.current_timestep_index
                 )
                 st.session_state.meshio_mesh = mesh_with_var
@@ -1366,7 +1315,7 @@ def main():
                 current_time = timesteps[st.session_state.current_timestep_index]['time_value']
                 st.markdown(f"""
                 <div class="time-display">
-                🕐 Timestep {st.session_state.current_timestep_index + 1} of {len(timesteps)} | 
+                🕐 Timestep {st.session_state.current_timestep_index + 1} of {len(timesteps)} |
                 t = {current_time:.4g}
                 </div>
                 """, unsafe_allow_html=True)
@@ -1514,7 +1463,6 @@ def main():
                         var_data = point_data.get(variable_name) or (cell_data.get(variable_name)[0] if cell_data.get(variable_name) else None)
                         if var_data is not None:
                             arr = np.asarray(var_data)
-                            # If multi‑component, show component range or magnitude?
                             if arr.ndim > 1 and arr.shape[1] > 1:
                                 mag = np.linalg.norm(arr, axis=1)
                                 st.metric("Magnitude range", f"{np.min(mag):.3g} to {np.max(mag):.3g}")
@@ -1724,4 +1672,3 @@ def main():
 # Entry Point
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    main()
