@@ -15,6 +15,7 @@ import re
 import math
 from datetime import datetime
 import pandas as pd
+import time
 warnings.filterwarnings('ignore')
 
 # -----------------------------------------------------------------------------
@@ -28,7 +29,7 @@ st.set_page_config(
     menu_items={
         'Get Help': 'https://mooseframework.inl.gov',
         'Report a bug': 'https://github.com/idaholab/moose/issues',
-        'About': "MOOSE Exodus Viewer v3.0\nBuilt with Streamlit + Plotly + Meshio"
+        'About': "MOOSE Exodus Viewer v4.0\nBuilt with Streamlit + Plotly + Meshio\nWith Time Animation Support"
     }
 )
 
@@ -87,6 +88,15 @@ st.markdown("""
     padding: 1rem;
     margin: 0.5rem 0;
 }
+.time-display {
+    background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+    border-radius: 8px;
+    padding: 0.5rem 1rem;
+    color: white;
+    text-align: center;
+    font-weight: bold;
+    font-size: 1.2rem;
+}
 div[data-testid="stExpander"] {
     border: 1px solid #e0e0e0;
     border-radius: 8px;
@@ -94,6 +104,12 @@ div[data-testid="stExpander"] {
 pre {
     max-height: 400px;
     overflow-y: auto;
+}
+.animation-controls {
+    background-color: #f0f2f6;
+    border-radius: 8px;
+    padding: 1rem;
+    margin: 1rem 0;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -172,11 +188,9 @@ def find_part_files_for_base(base_path, max_parts=1000):
         if part_file.exists():
             part_files.append(str(part_file))
         else:
-            # Stop at first missing part (assumes sequential numbering)
             if i > 1:
                 break
     
-    # Sort by part number to ensure correct order
     part_files.sort(key=lambda x: extract_part_number(os.path.basename(x)))
     return part_files
 
@@ -192,9 +206,8 @@ def combine_part_files_binary(part_files, output_path):
         with open(output_path, 'wb') as outfile:
             for part_file in part_files:
                 with open(part_file, 'rb') as infile:
-                    # Read in chunks to handle large files
                     while True:
-                        chunk = infile.read(8 * 1024 * 1024)  # 8MB chunks
+                        chunk = infile.read(8 * 1024 * 1024)
                         if not chunk:
                             break
                         outfile.write(chunk)
@@ -209,7 +222,7 @@ def get_combined_file_size(part_files):
     return total_bytes / (1024 * 1024)
 
 # -----------------------------------------------------------------------------
-# Helper Functions - Timestep Discovery from Exodus Files
+# Helper Functions - Timestep Discovery from Exodus Files (NEW)
 # -----------------------------------------------------------------------------
 def get_exodus_timesteps(file_path):
     """
@@ -220,7 +233,6 @@ def get_exodus_timesteps(file_path):
         import netCDF4
         
         with netCDF4.Dataset(file_path, 'r') as ds:
-            # Try common time variable names used by MOOSE/Exodus
             time_var = None
             for var_name in ['time_values', 'time', 'global_time_values', 'time_step']:
                 if var_name in ds.variables:
@@ -228,7 +240,6 @@ def get_exodus_timesteps(file_path):
                     break
             
             if time_var is None:
-                # Fallback: check for num_time_steps attribute
                 if hasattr(ds, 'num_time_steps'):
                     n_steps = int(getattr(ds, 'num_time_steps'))
                     return [
@@ -237,7 +248,6 @@ def get_exodus_timesteps(file_path):
                     ]
                 return None
             
-            # Extract time values
             times = time_var[:]
             return [
                 {'index': idx, 'time_value': float(tv), 'label': f't={float(tv):.4g} (step {idx})'}
@@ -269,14 +279,13 @@ def load_exodus_with_timestep(file_path, timestep_index=None):
 # -----------------------------------------------------------------------------
 def find_exodus_files(search_dir, recursive=True):
     """
-    Recursively find all Exodus files AND part-file groups.
-    Returns list of dicts with file info.
+    Recursively find all Exodus files in the given directory.
     """
-    exodus_extensions = ['.e', '.exo', '.exodus', '.out', '.ex2']
-    results = []
+    exodus_extensions = ['.e', '.exo', '.exodus', '.out', '.ex2', '.e-s001', '.e-s002']
+    exodus_files = []
     
     if not os.path.exists(search_dir):
-        return results
+        return exodus_files
     
     try:
         if recursive:
@@ -285,66 +294,25 @@ def find_exodus_files(search_dir, recursive=True):
                 for file in files:
                     if file.startswith('.'):
                         continue
-                    full_path = os.path.join(root, file)
                     file_ext = os.path.splitext(file)[1].lower()
-                    
-                    # Check for part files
-                    if is_part_file(file):
-                        base_name = re.sub(r'\.part\d+$', '', file, flags=re.IGNORECASE)
-                        base_path = os.path.join(root, base_name)
-                        # Only add base path once (will be processed below)
-                        continue
-                    elif file_ext in exodus_extensions or re.match(r'\.e-s\d+$', file_ext):
-                        results.append({
-                            'path': full_path,
-                            'display_name': get_file_display_name(full_path, search_dir),
-                            'is_part_group': False,
-                            'part_files': None
-                        })
+                    if file_ext in exodus_extensions or re.match(r'\.e-s\d+$', file_ext):
+                        full_path = os.path.join(root, file)
+                        exodus_files.append(full_path)
         else:
             for file in os.listdir(search_dir):
                 if file.startswith('.'):
                     continue
-                full_path = os.path.join(search_dir, file)
                 file_ext = os.path.splitext(file)[1].lower()
-                
-                if is_part_file(file):
-                    continue
-                elif file_ext in exodus_extensions:
-                    results.append({
-                        'path': full_path,
-                        'display_name': get_file_display_name(full_path, search_dir),
-                        'is_part_group': False,
-                        'part_files': None
-                    })
+                if file_ext in exodus_extensions:
+                    full_path = os.path.join(search_dir, file)
+                    exodus_files.append(full_path)
     except PermissionError as e:
         st.warning(f"Permission denied accessing: {search_dir}")
     except Exception as e:
         st.warning(f"Error scanning directory: {e}")
     
-    # Now find part-file groups and add them as separate entries
-    seen_bases = {r['path'] for r in results}
-    for root, dirs, files in ([(search_dir, [], os.listdir(search_dir))] if not recursive else os.walk(search_dir)):
-        for file in files:
-            if is_part_file(file):
-                base_name = re.sub(r'\.part\d+$', '', file, flags=re.IGNORECASE)
-                base_path = os.path.join(root, base_name)
-                
-                if base_path not in seen_bases:
-                    seen_bases.add(base_path)
-                    part_files = find_part_files_for_base(base_path)
-                    if part_files:
-                        total_size = get_combined_file_size(part_files)
-                        results.append({
-                            'path': base_path,
-                            'display_name': f"{get_file_display_name(base_path, search_dir)} ({len(part_files)} parts, {format_file_size(total_size)})",
-                            'is_part_group': True,
-                            'part_files': part_files,
-                            'total_size_mb': total_size
-                        })
-    
-    results.sort(key=lambda x: x['display_name'].lower())
-    return results
+    exodus_files.sort(key=lambda x: (os.path.dirname(x), os.path.basename(x).lower()))
+    return exodus_files
 
 def get_file_display_name(file_path, base_dir):
     """Creates a user-friendly display name showing relative path."""
@@ -383,7 +351,7 @@ def load_exodus_data(file_path, time_step=None):
     Reads an Exodus file using meshio.
     Args:
         file_path: Path to Exodus file
-        time_step: Optional time step index to load
+        time_step: Optional time step index to load (for multi-step files)
     Returns:
         meshio mesh object or None on error
     """
@@ -393,11 +361,11 @@ def load_exodus_data(file_path, time_step=None):
     
     try:
         with st.spinner(f"Reading {os.path.basename(file_path)}..."):
-            mesh = load_exodus_with_timestep(file_path, timestep_index=time_step)
+            if time_step is not None:
+                mesh = meshio.read(file_path, time_step=time_step)
+            else:
+                mesh = meshio.read(file_path)
             
-            if mesh is None:
-                return None
-                
             if mesh.points is None or len(mesh.points) == 0:
                 st.warning("Mesh has no points. File may be empty or corrupted.")
                 return None
@@ -438,7 +406,9 @@ def load_exodus_data(file_path, time_step=None):
         return None
 
 def analyze_mesh(meshio_mesh):
-    """Analyze mesh and return statistics dictionary."""
+    """
+    Analyze mesh and return statistics dictionary.
+    """
     if meshio_mesh is None:
         return {}
     
@@ -519,7 +489,9 @@ def analyze_mesh(meshio_mesh):
 # Helper Functions - Surface Extraction for Plotly
 # -----------------------------------------------------------------------------
 def extract_mesh_surfaces(meshio_mesh, cell_types_filter=None):
-    """Extract surface triangles from mesh for Plotly visualization."""
+    """
+    Extract surface triangles from mesh for Plotly visualization.
+    """
     if meshio_mesh is None:
         return None, None, None
     
@@ -647,7 +619,9 @@ def extract_mesh_surfaces(meshio_mesh, cell_types_filter=None):
 def create_plotly_mesh(points, faces, values=None, color_map='Viridis',
                        opacity=0.9, show_edges=False, title="Mesh",
                        show_scalar_bar=True, camera_preset='isometric'):
-    """Create a Plotly 3D mesh visualization with extensive customization."""
+    """
+    Create a Plotly 3D mesh visualization with extensive customization.
+    """
     if points is None or faces is None or len(points) == 0 or len(faces) == 0:
         fig = go.Figure()
         fig.add_annotation(
@@ -796,7 +770,9 @@ def create_variable_histogram(values, var_name, nbins=50):
 # Helper Functions - Format Conversion for ParaView
 # -----------------------------------------------------------------------------
 def get_meshio_write_formats():
-    """Dynamically get supported write formats from meshio."""
+    """
+    Dynamically get supported write formats from meshio.
+    """
     try:
         import meshio
         if hasattr(meshio, '_format_registry'):
@@ -809,7 +785,9 @@ def get_meshio_write_formats():
         return {'vtu', 'vtk', 'stl', 'ply', 'xdmf', 'exodus'}
 
 def convert_mesh_format(meshio_mesh, output_path, file_format):
-    """Convert mesh to specified format using meshio."""
+    """
+    Convert mesh to specified format using meshio.
+    """
     if meshio_mesh is None:
         return False, "No mesh data to export", 0
     
@@ -919,7 +897,9 @@ def export_variable_csv(meshio_mesh, variable_name, output_path):
 # Helper Functions - Data Processing
 # -----------------------------------------------------------------------------
 def get_variable_values(meshio_mesh, variable_name, faces, face_cell_map=None):
-    """Extract scalar values for a variable, mapped to faces."""
+    """
+    Extract scalar values for a variable, mapped to faces.
+    """
     if variable_name is None or faces is None or len(faces) == 0:
         return None
     
@@ -1000,15 +980,15 @@ def main():
     st.markdown("""
     **Visualize** MOOSE simulation results interactively in your browser.
     **Download** in ParaView-compatible formats for advanced post-processing.
-    **Supports**: Single `.e` files OR split `.e.part1`, `.e.part2`, ... files (auto-combined).
+    **Animate** through timesteps with the time slider.
     """)
     
     app_dir = os.path.dirname(os.path.abspath(__file__))
     dataset_dir = os.path.join(app_dir, "dataset")
     
     # Session state initialization
-    if 'selected_file_info' not in st.session_state:
-        st.session_state.selected_file_info = None
+    if 'selected_file_path' not in st.session_state:
+        st.session_state.selected_file_path = None
     if 'meshio_mesh' not in st.session_state:
         st.session_state.meshio_mesh = None
     if 'mesh_stats' not in st.session_state:
@@ -1021,19 +1001,26 @@ def main():
         st.session_state.faces = None
     if 'face_cell_map' not in st.session_state:
         st.session_state.face_cell_map = None
-    if 'combined_file_path' not in st.session_state:
-        st.session_state.combined_file_path = None
     if 'available_timesteps' not in st.session_state:
         st.session_state.available_timesteps = None
-    if 'selected_timestep' not in st.session_state:
-        st.session_state.selected_timestep = None
+    if 'current_timestep_index' not in st.session_state:
+        st.session_state.current_timestep_index = 0
+    if 'is_playing' not in st.session_state:
+        st.session_state.is_playing = False
+    if 'animation_speed' not in st.session_state:
+        st.session_state.animation_speed = 500
+    if 'combined_file_path' not in st.session_state:
+        st.session_state.combined_file_path = None
+    if 'last_loaded_timestep' not in st.session_state:
+        st.session_state.last_loaded_timestep = None
     
     # Clear cache button
-    if st.sidebar.button("🗑️ Clear Cache", help="Clear loaded mesh and combined files"):
+    if st.sidebar.button("🗑️ Clear Cache", help="Clear loaded mesh data"):
         for key in ['meshio_mesh', 'mesh_stats', 'points', 'faces', 'face_cell_map', 
-                    'combined_file_path', 'available_timesteps', 'selected_timestep']:
+                    'available_timesteps', 'current_timestep_index', 'combined_file_path', 
+                    'last_loaded_timestep']:
             st.session_state[key] = None
-        # Clean up temp combined files
+        st.session_state.is_playing = False
         if st.session_state.combined_file_path and os.path.exists(st.session_state.combined_file_path):
             try:
                 os.remove(st.session_state.combined_file_path)
@@ -1044,7 +1031,7 @@ def main():
     
     with st.sidebar:
         st.header("1. Select File")
-        exodus_entries = find_exodus_files(dataset_dir)
+        exodus_files = find_exodus_files(dataset_dir)
         
         source_option = st.radio(
             "File Source",
@@ -1053,40 +1040,27 @@ def main():
             horizontal=False
         )
         
-        selected_file_info = None
+        selected_file_path = None
         
         if source_option == "Dataset Folder":
-            if exodus_entries:
-                st.success(f"Found {len(exodus_entries)} file(s)/group(s)")
-                
-                file_options = {entry['display_name']: entry for entry in exodus_entries}
+            if exodus_files:
+                st.success(f"Found {len(exodus_files)} file(s)")
+                file_options = {get_file_display_name(f, app_dir): f for f in exodus_files}
                 selected_display = st.selectbox(
                     "Choose Exodus File",
                     list(file_options.keys()),
                     key="file_select",
                     index=0
                 )
-                selected_file_info = file_options[selected_display]
-                
-                # Display file info
-                if selected_file_info['is_part_group']:
-                    st.markdown(f"""
-                    <div class="warning-box">
-                    <strong>🧩 Split file group:</strong><br>
-                    Base: <code>{os.path.basename(selected_file_info['path'])}</code><br>
-                    Parts: {len(selected_file_info['part_files'])}<br>
-                    Total size: {format_file_size(selected_file_info['total_size_mb'])}
-                    </div>
-                    """, unsafe_allow_html=True)
-                else:
-                    size_mb = get_file_size_mb(selected_file_info['path'])
-                    st.markdown(f"""
-                    <div class="success-box">
-                    <strong>{os.path.basename(selected_file_info['path'])}</strong><br>
-                    Size: {format_file_size(size_mb)}<br>
-                    <small>{selected_file_info['path']}</small>
-                    </div>
-                    """, unsafe_allow_html=True)
+                selected_file_path = file_options[selected_display]
+                size_mb = get_file_size_mb(selected_file_path)
+                st.markdown(f"""
+                <div class="success-box">
+                <strong>{os.path.basename(selected_file_path)}</strong><br>
+                Size: {format_file_size(size_mb)}<br>
+                <small>{selected_file_path}</small>
+                </div>
+                """, unsafe_allow_html=True)
             else:
                 st.warning("No Exodus files in `dataset/`")
                 st.markdown(f"""
@@ -1098,73 +1072,20 @@ def main():
             uploaded_file = st.file_uploader(
                 "Upload Exodus File",
                 type=['e', 'exo', 'exodus', 'out', 'ex2'],
-                key="file_uploader",
-                accept_multiple_files=True  # Allow uploading multiple .part files
+                key="file_uploader"
             )
-            
             if uploaded_file:
-                if isinstance(uploaded_file, list) and len(uploaded_file) > 1:
-                    # Multiple files uploaded - check if they're parts
-                    part_files = [f for f in uploaded_file if is_part_file(f.name)]
-                    if part_files and len(part_files) == len(uploaded_file):
-                        # All are part files - combine them
-                        st.info(f"🧩 Detected {len(part_files)} part files - combining...")
-                        combined_name = f"combined_{os.path.splitext(part_files[0].name)[0]}.e"
-                        combined_path = os.path.join(st.session_state.cache_dir, combined_name)
-                        
-                        # Save parts to temp files and combine
-                        temp_parts = []
-                        for pf in sorted(part_files, key=lambda x: extract_part_number(x.name)):
-                            temp_path = os.path.join(st.session_state.cache_dir, pf.name)
-                            with open(temp_path, 'wb') as f:
-                                f.write(pf.getvalue())
-                            temp_parts.append(temp_path)
-                        
-                        if combine_part_files_binary(temp_parts, combined_path):
-                            selected_file_info = {
-                                'path': combined_path,
-                                'display_name': f"📦 Combined: {combined_name}",
-                                'is_part_group': True,
-                                'part_files': temp_parts,
-                                'total_size_mb': sum(len(pf.getvalue()) for pf in part_files) / (1024*1024)
-                            }
-                            st.session_state.combined_file_path = combined_path
-                            st.success("✅ Parts combined successfully")
-                        else:
-                            st.error("❌ Failed to combine part files")
-                    else:
-                        # Not all parts or mixed files - use first file
-                        first_file = uploaded_file[0]
-                        tmp_path = os.path.join(st.session_state.cache_dir, first_file.name)
-                        with open(tmp_path, 'wb') as f:
-                            f.write(first_file.getvalue())
-                        selected_file_info = {
-                            'path': tmp_path,
-                            'display_name': f"📄 {first_file.name}",
-                            'is_part_group': False,
-                            'part_files': None
-                        }
-                else:
-                    # Single file upload
-                    file = uploaded_file if not isinstance(uploaded_file, list) else uploaded_file[0]
-                    tmp_path = os.path.join(st.session_state.cache_dir, file.name)
-                    with open(tmp_path, 'wb') as f:
-                        f.write(file.getvalue())
-                    selected_file_info = {
-                        'path': tmp_path,
-                        'display_name': f"📄 {file.name}",
-                        'is_part_group': False,
-                        'part_files': None
-                    }
-                
-                if selected_file_info:
-                    size_mb = selected_file_info.get('total_size_mb') or get_file_size_mb(selected_file_info['path'])
-                    st.markdown(f"""
-                    <div class="success-box">
-                    <strong>{os.path.basename(selected_file_info['path'])}</strong><br>
-                    Size: {format_file_size(size_mb)}
-                    </div>
-                    """, unsafe_allow_html=True)
+                tmp_path = os.path.join(st.session_state.cache_dir, uploaded_file.name)
+                with open(tmp_path, 'wb') as f:
+                    f.write(uploaded_file.getvalue())
+                selected_file_path = tmp_path
+                size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+                st.markdown(f"""
+                <div class="success-box">
+                <strong>{uploaded_file.name}</strong><br>
+                Size: {format_file_size(size_mb)}
+                </div>
+                """, unsafe_allow_html=True)
         
         st.divider()
         st.header("2. Visualization Settings")
@@ -1184,61 +1105,71 @@ def main():
         )
         
         st.divider()
+        st.header("3. Time Animation (NEW)")
+        
+        # Animation controls placeholder (will be updated after file load)
+        st.caption("Time controls appear after file loads")
+        
+        st.divider()
         st.header("Info")
         st.markdown("""
-        **MOOSE Exodus Viewer v3.0**<br>
+        **MOOSE Exodus Viewer v4.0**<br>
         Streamlit + Plotly + Meshio<br>
         ParaView-compatible exports<br>
-        Auto-combines `.e.partN` split files<br>
+        **Time Animation Support**<br>
         **Exports:** VTU, VTK, STL, PLY, XDMF, CSV
         """)
     
     # Main content area
-    if selected_file_info:
-        # Determine load path and handle part file combination
-        load_path = None
+    if selected_file_path:
+        # Check for part files and combine if needed
+        load_path = selected_file_path
+        part_files = find_part_files_for_base(selected_file_path)
         
-        if selected_file_info['is_part_group'] and selected_file_info['part_files']:
-            # Need to combine part files
-            combined_name = f"combined_{os.path.basename(selected_file_info['path'])}_{os.urandom(4).hex()}.e"
+        if part_files:
+            combined_name = f"combined_{os.path.basename(selected_file_path)}_{os.urandom(4).hex()}.e"
             combined_path = os.path.join(st.session_state.cache_dir, combined_name)
             
-            # Check if already combined in this session
             if st.session_state.combined_file_path and os.path.exists(st.session_state.combined_file_path):
                 load_path = st.session_state.combined_file_path
-            elif combine_part_files_binary(selected_file_info['part_files'], combined_path):
+            elif combine_part_files_binary(part_files, combined_path):
                 load_path = combined_path
                 st.session_state.combined_file_path = combined_path
-                st.success(f"✅ Combined {len(selected_file_info['part_files'])} part files")
+                st.success(f"✅ Combined {len(part_files)} part files")
             else:
-                st.error("❌ Failed to combine part files. Cannot load mesh.")
-        else:
-            load_path = selected_file_info['path']
-            st.session_state.combined_file_path = None
+                st.error("❌ Failed to combine part files")
+                load_path = None
         
-        # Load mesh if needed
+        # Load mesh and timesteps if file changed
         if load_path and (
-            st.session_state.selected_file_info != selected_file_info or 
+            st.session_state.selected_file_path != load_path or 
             st.session_state.meshio_mesh is None
         ):
-            st.session_state.selected_file_info = selected_file_info
+            st.session_state.selected_file_path = load_path
             st.session_state.meshio_mesh = None
             st.session_state.mesh_stats = None
             st.session_state.points = None
             st.session_state.faces = None
             st.session_state.face_cell_map = None
+            st.session_state.last_loaded_timestep = None
             
-            # Get available timesteps BEFORE loading specific timestep
+            # Get available timesteps FIRST
             timesteps = get_exodus_timesteps(load_path)
             st.session_state.available_timesteps = timesteps
             
-            # Load mesh (with timestep if selected)
-            meshio_mesh = load_exodus_data(load_path, time_step=st.session_state.selected_timestep)
+            if timesteps:
+                st.session_state.current_timestep_index = len(timesteps) - 1  # Default to last
+            else:
+                st.session_state.current_timestep_index = 0
+            
+            # Load initial mesh
+            meshio_mesh = load_exodus_data(load_path, time_step=st.session_state.current_timestep_index)
             
             if meshio_mesh:
                 st.session_state.meshio_mesh = meshio_mesh
                 st.session_state.mesh_stats = analyze_mesh(meshio_mesh)
                 st.session_state.points, st.session_state.faces, st.session_state.face_cell_map = extract_mesh_surfaces(meshio_mesh)
+                st.session_state.last_loaded_timestep = st.session_state.current_timestep_index
                 st.rerun()
         else:
             meshio_mesh = st.session_state.meshio_mesh
@@ -1249,39 +1180,99 @@ def main():
             points = st.session_state.points
             faces = st.session_state.faces
             face_cell_map = st.session_state.face_cell_map
-            
-            # Display timestep selector if available
             timesteps = st.session_state.available_timesteps
+            
+            # Display timestep information and controls
             if timesteps and len(timesteps) > 1:
-                st.info(f"📊 File contains **{len(timesteps)} timesteps**")
+                st.markdown(f"""
+                <div class="time-display">
+                🕐 Timestep {st.session_state.current_timestep_index + 1} of {len(timesteps)} | 
+                {timesteps[st.session_state.current_timestep_index]['label']}
+                </div>
+                """, unsafe_allow_html=True)
                 
-                ts_labels = [ts['label'] for ts in timesteps]
-                current_idx = st.session_state.selected_timestep if st.session_state.selected_timestep is not None else len(timesteps) - 1
+                # Animation controls
+                col_anim1, col_anim2, col_anim3, col_anim4 = st.columns([1, 2, 1, 1])
                 
-                selected_ts_label = st.selectbox(
-                    "🕐 Select Timestep",
-                    ts_labels,
-                    key="timestep_select",
-                    index=min(current_idx, len(ts_labels) - 1)
-                )
+                with col_anim1:
+                    if st.button("⏮️ First", key="btn_first", use_container_width=True):
+                        st.session_state.current_timestep_index = 0
+                        st.session_state.is_playing = False
+                        st.rerun()
                 
-                selected_ts_idx = ts_labels.index(selected_ts_label)
-                selected_ts_data = timesteps[selected_ts_idx]
-                
-                # Reload if timestep changed
-                if st.session_state.selected_timestep != selected_ts_data['index']:
-                    st.session_state.selected_timestep = selected_ts_data['index']
-                    with st.spinner(f"Loading timestep {selected_ts_data['index']}..."):
-                        meshio_mesh = load_exodus_data(load_path, time_step=selected_ts_data['index'])
-                        if meshio_mesh:
-                            st.session_state.meshio_mesh = meshio_mesh
-                            st.session_state.points, st.session_state.faces, st.session_state.face_cell_map = extract_mesh_surfaces(meshio_mesh)
-                            st.success(f"✅ Loaded timestep: {selected_ts_data['label']}")
+                with col_anim2:
+                    if st.session_state.is_playing:
+                        if st.button("⏸️ Pause", key="btn_pause", use_container_width=True):
+                            st.session_state.is_playing = False
+                            st.rerun()
+                    else:
+                        if st.button("▶️ Play", key="btn_play", use_container_width=True):
+                            st.session_state.is_playing = True
                             st.rerun()
                 
-                # Show current timestep info
-                st.caption(f"Currently viewing: **{timesteps[st.session_state.selected_timestep]['label']}**" 
-                          if st.session_state.selected_timestep is not None else "")
+                with col_anim3:
+                    if st.button("⏭️ Last", key="btn_last", use_container_width=True):
+                        st.session_state.current_timestep_index = len(timesteps) - 1
+                        st.session_state.is_playing = False
+                        st.rerun()
+                
+                with col_anim4:
+                    animation_speed = st.slider(
+                        "Speed",
+                        min_value=100,
+                        max_value=2000,
+                        value=st.session_state.animation_speed,
+                        step=100,
+                        key="anim_speed",
+                        help="Milliseconds per frame"
+                    )
+                    st.session_state.animation_speed = animation_speed
+                
+                # Time slider
+                timestep_labels = [ts['label'] for ts in timesteps]
+                current_ts = st.slider(
+                    "⏱️ Time Slider",
+                    min_value=0,
+                    max_value=len(timesteps) - 1,
+                    value=st.session_state.current_timestep_index,
+                    step=1,
+                    format_func=lambda x: timestep_labels[x],
+                    key="time_slider"
+                )
+                
+                # Handle timestep change
+                if current_ts != st.session_state.current_timestep_index:
+                    st.session_state.current_timestep_index = current_ts
+                    st.session_state.is_playing = False
+                    st.rerun()
+                
+                # Handle auto-play
+                if st.session_state.is_playing:
+                    placeholder = st.empty()
+                    progress_bar = st.progress(0)
+                    
+                    while st.session_state.is_playing and st.session_state.current_timestep_index < len(timesteps) - 1:
+                        st.session_state.current_timestep_index += 1
+                        progress_bar.progress((st.session_state.current_timestep_index + 1) / len(timesteps))
+                        
+                        # Load new timestep
+                        with st.spinner(f"Loading timestep {st.session_state.current_timestep_index}..."):
+                            meshio_mesh = load_exodus_data(load_path, time_step=st.session_state.current_timestep_index)
+                            if meshio_mesh:
+                                st.session_state.meshio_mesh = meshio_mesh
+                                st.session_state.points, st.session_state.faces, st.session_state.face_cell_map = extract_mesh_surfaces(meshio_mesh)
+                                st.session_state.last_loaded_timestep = st.session_state.current_timestep_index
+                                st.rerun()
+                        
+                        time.sleep(st.session_state.animation_speed / 1000.0)
+                    
+                    st.session_state.is_playing = False
+                    progress_bar.empty()
+                    st.rerun()
+                
+                st.divider()
+            elif timesteps and len(timesteps) == 1:
+                st.info(f"📊 Single timestep: {timesteps[0]['label']}")
             
             # Metrics display
             col1, col2, col3, col4 = st.columns(4)
@@ -1374,8 +1365,6 @@ def main():
             st.subheader("Export for ParaView")
             with st.expander("Mesh Details", expanded=False):
                 st.write(f"**File:** `{os.path.basename(load_path)}`")
-                if selected_file_info['is_part_group']:
-                    st.write(f"**Source:** Combined from {len(selected_file_info['part_files'])} part files")
                 st.write(f"**Points:** {stats.get('n_points', 0):,}")
                 st.write(f"**Cells:** {stats.get('n_cells', 0):,}")
                 if stats.get('cell_types'):
@@ -1384,8 +1373,7 @@ def main():
                         st.write(f"  - `{ctype}`: {count:,}")
                 if timesteps:
                     st.write(f"**Timesteps:** {len(timesteps)}")
-                    if st.session_state.selected_timestep is not None:
-                        st.write(f"**Current:** {timesteps[st.session_state.selected_timestep]['label']}")
+                    st.write(f"**Current:** {timesteps[st.session_state.current_timestep_index]['label']}")
                 if stats.get('point_vars'):
                     st.write("**Point Variables:**")
                     for var in stats['point_vars']:
@@ -1407,7 +1395,7 @@ def main():
                 cols = st.columns(min(len(available_formats), 6))
                 for idx, (fmt_key, fmt_info) in enumerate(available_formats.items()):
                     with cols[idx % len(cols)]:
-                        export_filename = f"mesh_output{fmt_info['ext']}"
+                        export_filename = f"mesh_output_t{st.session_state.current_timestep_index}{fmt_info['ext']}"
                         export_path = os.path.join(st.session_state.cache_dir, export_filename)
                         success, message, file_size = convert_mesh_format(
                             meshio_mesh, export_path, fmt_key
@@ -1448,13 +1436,13 @@ def main():
             st.info("""
             **Recommendation:**
             - Use **VTU** for most ParaView workflows
-            - Use **PLY** for quick surface previews  
+            - Use **PLY** for quick surface previews
             - Use **CSV** (below) for data analysis in Excel/Python
             """)
             
             if variable_name:
                 st.markdown("### Export Variable Data (CSV)")
-                csv_filename = f"{variable_name}_data.csv"
+                csv_filename = f"{variable_name}_t{st.session_state.current_timestep_index}_data.csv"
                 csv_path = os.path.join(st.session_state.cache_dir, csv_filename)
                 csv_success, csv_msg = export_variable_csv(meshio_mesh, variable_name, csv_path)
                 if csv_success and os.path.exists(csv_path):
@@ -1499,7 +1487,7 @@ def main():
             ├── app.py
             ├── requirements.txt
             └── dataset/
-                ├── simulation.e              # Single file
+                ├── simulation.e              # Single file with timesteps
                 ├── simulation.e.part1        # Split file part 1
                 ├── simulation.e.part2        # Split file part 2
                 └── simulation.e.part3        # Split file part 3
@@ -1518,25 +1506,26 @@ def main():
             
             ### Installation
             ```bash
-            # Minimal
+            # Required for timestep support
             pip install streamlit meshio plotly netCDF4
             
             # Full (with all exports)
             pip install streamlit meshio plotly netCDF4 h5py pandas
             ```
             
-            ### Split File Notes
-            - Files split with `.part1`, `.part2`, ... are **auto-detected & combined**
-            - Ensure ALL parts are present and sequentially numbered
-            - Binary recombination restores original NetCDF structure
-            - Timestep metadata is preserved in the combined file
+            ### Time Animation Features
+            - **Time Slider**: Scrub through all timesteps
+            - **Play/Pause**: Auto-animate through simulation
+            - **First/Last**: Jump to start or end
+            - **Speed Control**: Adjust animation speed (100-2000ms per frame)
+            - **Timestep Display**: Shows current time value and index
             """)
     
     st.divider()
     st.markdown("""
     <div style="text-align: center; color: gray; padding: 1rem;">
     <small>
-    MOOSE Exodus Viewer v3.0 |
+    MOOSE Exodus Viewer v4.0 |
     Built with Streamlit + Plotly + Meshio |
     <a href="https://mooseframework.inl.gov" target="_blank">MOOSE Framework</a>
     </small>
