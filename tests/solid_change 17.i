@@ -1,5 +1,6 @@
 # Lily 2026/2/26
-
+# Phi is set to an initial area of zero.
+# The free energy has phi
 [GlobalParams]
   seed = 12345
 []
