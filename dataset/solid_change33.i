@@ -1,4 +1,8 @@
 # Lily 2026/2/26
+# Order parameters: Electrode (eta = 0, phi =0), Liquid Electrolyte ( eta = 1, phi = 0), Solid Template within the Electrolyte Geometry ( eta = 0, phi = 1)
+# The dendrites grow from electrode (eta=0, phi=0) to liquid electrolyte (eta=1,phi = 0)
+# The dendrites do not grow at the electrode/template interface
+# The dendrites also do not evolve at the electrolyte/template interface
 
 [GlobalParams]
   seed = 12345
