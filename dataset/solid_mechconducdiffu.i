@@ -628,6 +628,7 @@
 
 [Outputs]
   exodus = true
+  csv = true  # the time information is available in csv file as well, and so output in csv format is desirable
   time_step_interval = 1
   file_base = results/solidmechdiff106/test1
 []
